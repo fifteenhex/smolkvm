@@ -628,7 +628,7 @@ static inline int __smolkvm_find_free_mmio_slot(const struct smolkvm_vm *vm)
 	     __mmio++) \
 		if (*__mmio)
 
-static inline int __smolkvm_plugin_mmio(struct smolkvm_vm *vm, const struct smolkvm_mmio *mmio)
+static inline int __smolkvm_plugin_mmio(struct smolkvm_vm *vm, struct smolkvm_mmio *mmio)
 {
 	int slot = __smolkvm_find_free_mmio_slot(vm);
 
@@ -845,8 +845,11 @@ static void __smolkvm_console_write(struct smolkvm_vm *vm,
 
 	if (offset == __SMOLKVM_CONSOLE_REG_TXRX && len == 1) {
 		char ch = (char) value;
-		if (connected_socket >= 0)
-			write(connected_socket, &ch, sizeof(ch));
+		if (connected_socket >= 0) {
+			ssize_t wret = write(connected_socket, &ch, sizeof(ch));
+			if (wret != (ssize_t) sizeof(ch))
+				__smolkvm_debug("console: short write to client socket\n");
+		}
 
 		printf("** %c **\n", (char) value);
 	}
@@ -862,7 +865,7 @@ static void __smolkvm_console_post_run(struct smolkvm_vm *vm,
 
 #define SMOLKVM_CONSOLE_PHYS 0x1000
 
-static const struct smolkvm_mmio __smolkvm_console = {
+static struct smolkvm_mmio __smolkvm_console = {
 	.name = "console",
 	.phys = SMOLKVM_CONSOLE_PHYS,
 	.len = 8,
@@ -922,7 +925,7 @@ static inline int __smolkvm_find_memregion(const struct smolkvm_vm *vm, uint64_t
 
 		if ((addr >= phys_start) && (addr < phys_end)) {
 #ifdef SMOLKVM_DEBUG
-			printf("0x%llx is region %d\n", addr, i);
+			printf("0x%llx is region %d\n", (unsigned long long) addr, i);
 #endif
 			return i;
 		}
@@ -1249,7 +1252,7 @@ static inline int __smolkvm_gdb_stub_process_packet_read_mem(struct smolkvm_vm *
 	int i;
 
 #ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
-	printf("read memory: addr=0x%llx len=%lld\n", addr, len);
+	printf("read memory: addr=0x%llx len=%llu\n", (unsigned long long) addr, (unsigned long long) len);
 #endif
 
 	__smolkvm_memory_read(vm, addr, len, buff);
