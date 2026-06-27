@@ -904,7 +904,7 @@ static inline int __smolkvm_console_create(struct smolkvm_vm *vm)
 #ifdef SMOLKVM_FOLD
 
 #define SMOLKVM_OFFSET_IN_MEMREGION(__memregion, __physaddr) \
-	(__memregion->guest_phys_addr - __physaddr)
+	(__physaddr - __memregion->guest_phys_addr)
 
 #define SMOLKVM_MEMREGION_PTR(_memregion, _physaddr) \
 	((void *) _memregion->userspace_addr + SMOLKVM_OFFSET_IN_MEMREGION(_memregion, _physaddr))
@@ -934,16 +934,30 @@ static inline int __smolkvm_find_memregion(const struct smolkvm_vm *vm, uint64_t
 	return -1;
 }
 
+static inline int __smolkvm_memory_check_bounds(uint64_t addr, uint64_t len, const struct kvm_userspace_memory_region *memory_region)
+{
+	if (len > (memory_region->guest_phys_addr + memory_region->memory_size) - addr)
+		return -1;
+
+	return 0;
+}
+
 static inline int __smolkvm_memory_read(const struct smolkvm_vm *vm, uint64_t addr, uint64_t len, void *dst)
 {
 	const struct kvm_userspace_memory_region *memory_region;
 	int region;
+	int ret;
 
 	region = __smolkvm_find_memregion(vm, addr);
 	if (region < 0)
 		return -1;
 
 	memory_region = &vm->memregions[region];
+
+	ret = __smolkvm_memory_check_bounds(addr, len, memory_region);
+	if (ret)
+		return ret;
+
 	memcpy(dst, SMOLKVM_MEMREGION_PTR(memory_region, addr), len);
 
 	return 0;
@@ -953,12 +967,18 @@ static inline int __smolkvm_memory_write(const struct smolkvm_vm *vm, uint64_t a
 {
 	const struct kvm_userspace_memory_region *memory_region;
 	int region;
+	int ret;
 
 	region = __smolkvm_find_memregion(vm, addr);
 	if (region < 0)
 		return -1;
 
 	memory_region = &vm->memregions[region];
+
+	ret = __smolkvm_memory_check_bounds(addr, len, memory_region);
+	if (ret)
+		return ret;
+
 	memcpy(SMOLKVM_MEMREGION_PTR(memory_region, addr), src, len);
 
 	return 0;
