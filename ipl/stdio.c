@@ -9,6 +9,9 @@ static int smolkvm_putc(char c, FILE *file)
 {
 	(void) file;
 
+	if (c == '\n')
+		*rxd = '\r';
+
 	*rxd = c;
 
 	return c;

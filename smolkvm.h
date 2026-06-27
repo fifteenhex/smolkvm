@@ -91,6 +91,8 @@
 #define SMOLKVM_ERR_CREATE_SETSREGS 109
 #define SMOLKVM_ERR_CREATE_GETREGS  110
 #define SMOLKVM_ERR_CREATE_SETREGS  111
+#define SMOLKVM_ERR_MMIO_NO_DEVICE  112
+#define SMOLKVM_ERR_UNHANDLED_EXIT  113
 
 #endif
 /* -- */
@@ -682,10 +684,9 @@ static inline int __smolkvm_handle_mmio(struct smolkvm_vm *vm)
 			    run->mmio.data[4], run->mmio.data[5], run->mmio.data[6], run->mmio.data[7]);
 
 	if (mmio_device < 0) {
-		printf("didn't find mmio device for 0x%lx\n", mmio_addr);
+		printf("unhandled MMIO access to 0x%lx, stopping the VM\n", mmio_addr);
 
-		/* TODO should be an error roight? */
-		return 0;
+		return -SMOLKVM_ERR_MMIO_NO_DEVICE;
 	}
 
 	mmio = vm->mmioregions[mmio_device];
@@ -2431,8 +2432,18 @@ int smolkvm_run(struct smolkvm_vm *vm)
 		ret = __smolkvm_handle_mmio(vm);
 		if (ret)
 			return ret;
-	default:
 		break;
+	case KVM_EXIT_DEBUG:
+		/* GDB single-step / breakpoint: let the default loop handle it */
+		break;
+	default:
+		/*
+		 * Anything we don't explicitly recognise (internal errors, a
+		 * fault that couldn't be delivered, stray IO, ...) stops the VM
+		 * rather than silently re-entering KVM_RUN and livelocking.
+		 */
+		printf("unhandled exit reason %u, stopping the VM\n", exit_reason);
+		return -SMOLKVM_ERR_UNHANDLED_EXIT;
 	}
 
 	return 0;
