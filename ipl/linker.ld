@@ -4,32 +4,35 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x200000;
+	. = 0x200000;
 
-    .text : {
-        *(.text)
-        *(.text.*)
-    }
+	.text : {
+		*(.text)
+		*(.text.*)
+	}
 
-    .rodata : {
-        *(.rodata)
-        *(.rodata.*)
-    }
+	.rodata : {
+		*(.rodata)
+		*(.rodata.*)
+	}
 
-    .data : {
-        *(.data)
-        *(.data.*)
-    }
+	.data : {
+		*(.data)
+		*(.data.*)
+	}
 
-    .bss : {
-        *(.bss)
-        *(.bss.*)
-        *(COMMON)
-    }
+	.bss : {
+		*(.bss)
+		*(.bss.*)
+		*(COMMON)
+	}
 
-    /DISCARD/ : {
-        *(.note.*)
-        *(.comment)
-        *(.eh_frame)
-    }
+	. = ALIGN(4096);
+	_stack = . + 4096;
+
+	/DISCARD/ : {
+		*(.note.*)
+		*(.comment)
+		*(.eh_frame)
+	}
 }

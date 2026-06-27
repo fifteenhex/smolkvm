@@ -1,7 +1,7 @@
 all: ipl
 
 build:
-	meson setup build
+	meson setup build --cross-file cross.x86_64
 
 .PHONY: ipl
 

@@ -9,7 +9,7 @@ COPTS= -ggdb \
 	-std=c99 \
 	-Os
 
-IPL=ipl/build/ipl.elf
+IPL=ipl/build/ipl
 
 .PHONY: $(IPL)
 $(IPL):
