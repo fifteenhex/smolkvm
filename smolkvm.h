@@ -448,11 +448,11 @@ static const unsigned char __smolkvm_gdb_stub_nak = '-';
 static const unsigned char __smolkvm_gdb_stub_pktstart = '$';
 static const unsigned char __smolkvm_gdb_stub_pktend = '#';
 
-static const unsigned char *__smolkvm_gdb_pkt_query_attached = "Attached";
-static const unsigned char *__smolkvm_gdb_pkt_query_support = "Supported:";
-static const unsigned char *__smolkvm_gdb_pkt_query_xfer = "Xfer:features:read:";
-static const unsigned char *__smolkvm_gdb_pkt_v_cont = "Cont?";
-static const unsigned char *__smolkvm_gdb_pkt_v_mustreplyempty = "MustReplyEmpty";
+static const unsigned char __smolkvm_gdb_pkt_query_attached[] = "Attached";
+static const unsigned char __smolkvm_gdb_pkt_query_support[] = "Supported:";
+static const unsigned char __smolkvm_gdb_pkt_query_xfer[] = "Xfer:features:read:";
+static const unsigned char __smolkvm_gdb_pkt_v_cont[] = "Cont?";
+static const unsigned char __smolkvm_gdb_pkt_v_mustreplyempty[] = "MustReplyEmpty";
 
 enum smolkvm_gdb_stub_type {
 	SMOLKVM_GDB_STUB_UNKNOWN,
@@ -545,7 +545,8 @@ static inline int __smolkvm_gdb_split_value_comma_value(const char* str, unsigne
 }
 
 #define __smolkvm_gdb_stub_start_match(_token) \
-	(memcmp(raw, _token, sizeof(_token) -1) == 0)
+	(len >= (sizeof(_token) - 1) && \
+	 memcmp(raw, _token, sizeof(_token) - 1) == 0)
 
 static inline int __smolkvm_gdb_stub_pkt_unpack(const unsigned char *raw,
 	unsigned int len, struct smolkvm_gdb_stub_pkt *pkt)
