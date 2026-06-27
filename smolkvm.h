@@ -527,7 +527,7 @@ static inline bool __smolkvm_gdb_stub_pkt_checksum(const char* pkt, unsigned int
 	return __smolkvm_gdb_stub_checksum(pkt, pktlen) == from_packet;
 }
 
-static inline int __smolkvm_gdb_split_value_comma_value(const char* str, unsigned int len,
+static inline void __smolkvm_gdb_split_value_comma_value(const char* str, unsigned int len,
 							uint64_t *left, uint64_t *right)
 {
 	unsigned long long l, r;
@@ -2466,7 +2466,7 @@ static bool __smolkvm_stopped(const struct smolkvm_vm *vm)
 #endif
 }
 
-static bool __smolkvm_stop(struct smolkvm_vm *vm)
+static void __smolkvm_stop(struct smolkvm_vm *vm)
 {
 #ifdef SMOLKVM_WANT_GDB_STUB
 	struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
@@ -2475,7 +2475,7 @@ static bool __smolkvm_stop(struct smolkvm_vm *vm)
 #endif
 }
 
-static int __smolkvm_default_loop_pre_run(struct smolkvm_vm *vm)
+static void __smolkvm_default_loop_pre_run(struct smolkvm_vm *vm)
 {
 	struct smolkvm_mmio **mmio;
 
@@ -2490,8 +2490,6 @@ static int __smolkvm_default_loop_pre_run(struct smolkvm_vm *vm)
 	int pktret = __smolkvm_gdb_stub_read_packet(vm, &pkt);
 	if (pktret == 1)
 		__smolkvm_gdb_stub_process_packet(vm, &pkt);
-#else
-	return 0;
 #endif
 }
 
@@ -2517,7 +2515,7 @@ static int __smolkvm_default_loop_configure_run(struct smolkvm_vm *vm)
 #endif
 }
 
-static int __smolkvm_default_loop_post_run(struct smolkvm_vm *vm)
+static void __smolkvm_default_loop_post_run(struct smolkvm_vm *vm)
 {
 	struct smolkvm_mmio **mmio;
 
