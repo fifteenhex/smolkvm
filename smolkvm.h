@@ -1474,6 +1474,110 @@ static inline int __smolkvm_setmemory(struct smolkvm_vm *vm, int which)
 #endif
 /* -- */
 
+/* Memory map dump */
+#ifdef SMOLKVM_FOLD
+
+enum __smolkvm_mapentry_type {
+	__SMOLKVM_MAPENTRY_RAM,
+	__SMOLKVM_MAPENTRY_MMIO,
+};
+
+struct __smolkvm_mapentry {
+	uint64_t start;
+	uint64_t len;
+	uint64_t backing;	/* host userspace addr for RAM, unused for MMIO */
+	const char *name;	/* device name for MMIO, NULL for RAM */
+	enum __smolkvm_mapentry_type type;
+};
+
+/*
+ * Print a byte count as a human friendly size. Only collapses on exact
+ * power-of-1024 boundaries so we never lie about the real size, and avoids
+ * width specifiers so it behaves the same under nolibc.
+ */
+static inline void __smolkvm_print_human_size(uint64_t bytes)
+{
+	static const char *units[] = { "B", "KiB", "MiB", "GiB", "TiB" };
+	unsigned int u = 0;
+
+	while (bytes >= SMOLKVM_SZ_1K && (bytes % SMOLKVM_SZ_1K) == 0 &&
+	       u < SMOLKVM_ARRAYSIZE(units) - 1) {
+		bytes /= SMOLKVM_SZ_1K;
+		u++;
+	}
+
+	printf("%llu %s", (unsigned long long)bytes, units[u]);
+}
+
+/*
+ * Dump the current guest physical memory map: every plugged-in RAM region and
+ * every MMIO device, sorted by guest physical address.
+ */
+void smolkvm_dump_memory_map(const struct smolkvm_vm *vm)
+{
+	struct __smolkvm_mapentry entries[SMOLKVM_MEMREGIONS_NUM + SMOLKVM_MMIOREGIONS_NUM];
+	unsigned int n = 0;
+	unsigned int i, j;
+
+	/* Gather the RAM regions */
+	for (i = 0; i < vm->memory_region_plugged_in; i++) {
+		const struct kvm_userspace_memory_region *r = &vm->memregions[i];
+
+		entries[n].start   = r->guest_phys_addr;
+		entries[n].len     = r->memory_size;
+		entries[n].backing = r->userspace_addr;
+		entries[n].name    = NULL;
+		entries[n].type    = __SMOLKVM_MAPENTRY_RAM;
+		n++;
+	}
+
+	/* Gather the MMIO devices */
+	for (i = 0; i < vm->mmio_plugged_in; i++) {
+		const struct smolkvm_mmio *m = vm->mmioregions[i];
+
+		entries[n].start   = m->phys;
+		entries[n].len     = m->len;
+		entries[n].backing = 0;
+		entries[n].name    = m->name;
+		entries[n].type    = __SMOLKVM_MAPENTRY_MMIO;
+		n++;
+	}
+
+	/* Insertion sort by start address so the map reads top-down */
+	for (i = 1; i < n; i++) {
+		struct __smolkvm_mapentry tmp = entries[i];
+
+		for (j = i; j > 0 && entries[j - 1].start > tmp.start; j--)
+			entries[j] = entries[j - 1];
+
+		entries[j] = tmp;
+	}
+
+	printf("Guest memory map (%u region%s):\n", n, n == 1 ? "" : "s");
+
+	for (i = 0; i < n; i++) {
+		const struct __smolkvm_mapentry *e = &entries[i];
+		uint64_t end = e->start + e->len - 1;
+
+		printf("  [%s] 0x%016llx - 0x%016llx (",
+		       e->type == __SMOLKVM_MAPENTRY_RAM ? "ram " : "mmio",
+		       (unsigned long long)e->start,
+		       (unsigned long long)end);
+		__smolkvm_print_human_size(e->len);
+		printf(")");
+
+		if (e->type == __SMOLKVM_MAPENTRY_RAM)
+			printf(" -> host 0x%016llx", (unsigned long long)e->backing);
+		else
+			printf(" %s", e->name ? e->name : "(unnamed)");
+
+		printf("\n");
+	}
+}
+
+#endif
+/* -- */
+
 /* ELF loading */
 #ifdef SMOLKVM_FOLD
 
@@ -1612,6 +1716,9 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 	ret = __smolkvm_setmemory(vm, 0);
 	if (ret)
 		return -SMOLKVM_ERR_SETMEMORYREGION;
+
+	/* We now have one RAM region plugged in (slot 0) */
+	vm->memory_region_plugged_in = 1;
 
 	/* Create the initial page tables */
 	__smolkvm_create_initial_pagetables(vm);

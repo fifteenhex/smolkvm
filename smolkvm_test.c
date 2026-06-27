@@ -13,6 +13,8 @@ int main(int argc, char **argv, char **envp)
 		return 1;
 	}
 
+	smolkvm_dump_memory_map(&vm);
+
 	ret = smolkvm_load_elf_file(&vm, "ipl/ipl.elf");
 
 #ifdef SMOLKVM_WANT_GDB_STUB
