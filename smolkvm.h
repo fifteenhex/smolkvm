@@ -215,9 +215,11 @@ struct smolkvm_vm {
 	struct smolkvm_pgtable *pgtables;
 
 	struct kvm_userspace_memory_region memregions[SMOLKVM_MEMREGIONS_NUM];
+	/* Running count only; per-slot occupancy (memory_size != 0) is authoritative */
 	unsigned int memory_region_plugged_in;
 
 	struct smolkvm_mmio *mmioregions[SMOLKVM_MMIOREGIONS_NUM];
+	/* Running count only; per-slot occupancy (pointer != NULL) is authoritative */
 	unsigned int mmio_plugged_in;
 
 #ifdef SMOLKVM_WANT_GDB_STUB
@@ -226,6 +228,48 @@ struct smolkvm_vm {
 
 	bool was_interrupted;
 };
+
+#endif
+/* -- */
+
+/* Slot management: per-slot occupancy is the source of truth */
+#ifdef SMOLKVM_FOLD
+
+/* An MMIO slot is in use when it holds a device pointer */
+static inline bool __smolkvm_mmio_slot_used(const struct smolkvm_vm *vm, unsigned int slot)
+{
+	return vm->mmioregions[slot] != NULL;
+}
+
+/* A RAM slot is in use when it has a non-zero size (KVM treats size 0 as empty) */
+static inline bool __smolkvm_memregion_slot_used(const struct smolkvm_vm *vm, unsigned int slot)
+{
+	return vm->memregions[slot].memory_size != 0;
+}
+
+/* First free MMIO slot, or -1 if the table is full */
+static inline int __smolkvm_find_free_mmio_slot(const struct smolkvm_vm *vm)
+{
+	unsigned int i;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->mmioregions); i++)
+		if (!__smolkvm_mmio_slot_used(vm, i))
+			return (int) i;
+
+	return -1;
+}
+
+/* First free RAM slot, or -1 if the table is full */
+static inline int __smolkvm_find_free_memregion_slot(const struct smolkvm_vm *vm)
+{
+	unsigned int i;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->memregions); i++)
+		if (!__smolkvm_memregion_slot_used(vm, i))
+			return (int) i;
+
+	return -1;
+}
 
 #endif
 /* -- */
@@ -580,24 +624,41 @@ static inline int __smolkvm_gdb_stub_pkt_unpack(const unsigned char *raw,
 #ifdef SMOLKVM_FOLD
 
 #define __smolkvm_foreach_mmio(_vm, __mmio) \
-	for (__mmio = &_vm->mmioregions[0]; __mmio != &_vm->mmioregions[_vm->mmio_plugged_in]; __mmio++)
+	for (__mmio = &(_vm)->mmioregions[0]; \
+	     __mmio != &(_vm)->mmioregions[SMOLKVM_ARRAYSIZE((_vm)->mmioregions)]; \
+	     __mmio++) \
+		if (*__mmio)
 
-static inline void __smolkvm_plugin_mmio(struct smolkvm_vm *vm, const struct smolkvm_mmio *mmio)
+static inline int __smolkvm_plugin_mmio(struct smolkvm_vm *vm, const struct smolkvm_mmio *mmio)
 {
-	__smolkvm_debug("Plugging in MMIO device \'%s\' to slot %d\n",
-			mmio->name, vm->mmio_plugged_in);
+	int slot = __smolkvm_find_free_mmio_slot(vm);
 
-	vm->mmioregions[vm->mmio_plugged_in++] = mmio;
+	if (slot < 0) {
+		printf("no free mmio slots, cannot plug in \'%s\'\n", mmio->name);
+		return -1;
+	}
+
+	__smolkvm_debug("Plugging in MMIO device \'%s\' to slot %d\n",
+			mmio->name, slot);
+
+	vm->mmioregions[slot] = mmio;
+	vm->mmio_plugged_in++;
+
+	return 0;
 }
 
 static inline int __smolkvm_find_mmio_device(const struct smolkvm_vm *vm, uint64_t addr)
 {
-	int i;
+	unsigned int i;
 
-	for (i = 0; i < (int) vm->mmio_plugged_in; i++) {
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->mmioregions); i++) {
 		struct smolkvm_mmio *mmio = vm->mmioregions[i];
+
+		if (!mmio)
+			continue;
+
 		if ((addr >= mmio->phys) && (addr < (mmio->phys + mmio->len)))
-			return i;
+			return (int) i;
 	}
 
 	return -1;
@@ -855,6 +916,10 @@ static inline int __smolkvm_find_memregion(const struct smolkvm_vm *vm, uint64_t
 		const struct kvm_userspace_memory_region *memory_region = &vm->memregions[i];
 		uint64_t phys_start = memory_region->guest_phys_addr;
 		uint64_t phys_end = phys_start + memory_region->memory_size;
+
+		/* Skip empty / unplugged slots */
+		if (memory_region->memory_size == 0)
+			continue;
 
 		if ((addr >= phys_start) && (addr < phys_end)) {
 #ifdef SMOLKVM_DEBUG
@@ -1521,8 +1586,11 @@ void smolkvm_dump_memory_map(const struct smolkvm_vm *vm)
 	unsigned int i, j;
 
 	/* Gather the RAM regions */
-	for (i = 0; i < vm->memory_region_plugged_in; i++) {
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->memregions); i++) {
 		const struct kvm_userspace_memory_region *r = &vm->memregions[i];
+
+		if (r->memory_size == 0)
+			continue;
 
 		entries[n].start   = r->guest_phys_addr;
 		entries[n].len     = r->memory_size;
@@ -1533,8 +1601,11 @@ void smolkvm_dump_memory_map(const struct smolkvm_vm *vm)
 	}
 
 	/* Gather the MMIO devices */
-	for (i = 0; i < vm->mmio_plugged_in; i++) {
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->mmioregions); i++) {
 		const struct smolkvm_mmio *m = vm->mmioregions[i];
+
+		if (!m)
+			continue;
 
 		entries[n].start   = m->phys;
 		entries[n].len     = m->len;
@@ -1592,14 +1663,17 @@ int smolkvm_map_memory(struct smolkvm_vm *vm, uint64_t gpa, uint64_t size)
 {
 	struct kvm_userspace_memory_region *memory_region;
 	unsigned int slot;
+	int free_slot;
 	void *memory;
 	int ret;
 
-	if (vm->memory_region_plugged_in >= SMOLKVM_ARRAYSIZE(vm->memregions)) {
+	free_slot = __smolkvm_find_free_memregion_slot(vm);
+	if (free_slot < 0) {
 		printf("no free memory slots, cannot map 0x%llx bytes at 0x%llx\n",
 			   (unsigned long long) size, (unsigned long long) gpa);
 		return -1;
 	}
+	slot = (unsigned int) free_slot;
 
 	/* KVM requires the size to be a non-zero multiple of the page size */
 	if (size == 0 || (size & (SMOLKVM_SZ_4K - 1))) {
@@ -1618,8 +1692,6 @@ int smolkvm_map_memory(struct smolkvm_vm *vm, uint64_t gpa, uint64_t size)
 
 	memset(memory, 0, size);
 
-	/* todo fix this to find an unplugged slot */
-	slot = vm->memory_region_plugged_in;
 	memory_region = &vm->memregions[slot];
 
 	memory_region->slot = slot;
