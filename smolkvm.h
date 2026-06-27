@@ -1555,16 +1555,11 @@ enum __smolkvm_mapentry_type {
 struct __smolkvm_mapentry {
 	uint64_t start;
 	uint64_t len;
-	uint64_t backing;	/* host userspace addr for RAM, unused for MMIO */
-	const char *name;	/* device name for MMIO, NULL for RAM */
+	uint64_t backing;
+	const char *name;
 	enum __smolkvm_mapentry_type type;
 };
 
-/*
- * Print a byte count as a human friendly size. Only collapses on exact
- * power-of-1024 boundaries so we never lie about the real size, and avoids
- * width specifiers so it behaves the same under nolibc.
- */
 static inline void __smolkvm_print_human_size(uint64_t bytes)
 {
 	static const char *units[] = { "B", "KiB", "MiB", "GiB", "TiB" };
@@ -1579,10 +1574,6 @@ static inline void __smolkvm_print_human_size(uint64_t bytes)
 	printf("%llu %s", (unsigned long long)bytes, units[u]);
 }
 
-/*
- * Dump the current guest physical memory map: every plugged-in RAM region and
- * every MMIO device, sorted by guest physical address.
- */
 void smolkvm_dump_memory_map(const struct smolkvm_vm *vm)
 {
 	struct __smolkvm_mapentry entries[SMOLKVM_MEMREGIONS_NUM + SMOLKVM_MMIOREGIONS_NUM];
@@ -1764,8 +1755,8 @@ struct __smolkvm_mailbox_priv {
 static struct __smolkvm_mailbox_priv __smolkvm_mailbox_priv;
 
 static uint64_t __smolkvm_mailbox_dispatch(struct smolkvm_vm *vm,
-										   struct __smolkvm_mailbox_priv *mb,
-										   uint64_t command)
+					   struct __smolkvm_mailbox_priv *mb,
+					   uint64_t command)
 {
 	int ret;
 
@@ -2065,9 +2056,9 @@ static void __smolkvm_timer_update(struct smolkvm_vm *vm, struct __smolkvm_timer
 }
 
 static uint64_t __smolkvm_timer_read(struct smolkvm_vm *vm,
-									 struct smolkvm_mmio *mmio,
-									 uint64_t offset,
-									 uint8_t len)
+				     struct smolkvm_mmio *mmio,
+				     uint64_t offset,
+				     uint8_t len)
 {
 	struct __smolkvm_timer_priv *t = mmio->priv;
 	uint64_t now;
@@ -2096,10 +2087,10 @@ static uint64_t __smolkvm_timer_read(struct smolkvm_vm *vm,
 }
 
 static void __smolkvm_timer_write(struct smolkvm_vm *vm,
-								  struct smolkvm_mmio *mmio,
-								  uint64_t offset,
-								  uint8_t len,
-								  uint64_t value)
+				  struct smolkvm_mmio *mmio,
+				  uint64_t offset,
+				  uint8_t len,
+				  uint64_t value)
 {
 	struct __smolkvm_timer_priv *t = mmio->priv;
 
