@@ -1,11 +1,14 @@
-all: ipl.elf
+all: ipl
 
-ipl.elf: start.o linker.ld
-	$(LD) -T linker.ld start.o -o $@
+build:
+	meson setup build
 
-start.o : start.S
-	$(AS) $< -o $@
+.PHONY: ipl
+
+ipl: | build
+	meson compile -C build
 
 .PHONY: clean
+
 clean:
-	rm -f *.elf *.o
+	rm -rf build

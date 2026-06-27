@@ -236,28 +236,9 @@ struct smolkvm_vm {
 /* Slot management: per-slot occupancy is the source of truth */
 #ifdef SMOLKVM_FOLD
 
-/* An MMIO slot is in use when it holds a device pointer */
-static inline bool __smolkvm_mmio_slot_used(const struct smolkvm_vm *vm, unsigned int slot)
-{
-	return vm->mmioregions[slot] != NULL;
-}
-
-/* A RAM slot is in use when it has a non-zero size (KVM treats size 0 as empty) */
 static inline bool __smolkvm_memregion_slot_used(const struct smolkvm_vm *vm, unsigned int slot)
 {
 	return vm->memregions[slot].memory_size != 0;
-}
-
-/* First free MMIO slot, or -1 if the table is full */
-static inline int __smolkvm_find_free_mmio_slot(const struct smolkvm_vm *vm)
-{
-	unsigned int i;
-
-	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->mmioregions); i++)
-		if (!__smolkvm_mmio_slot_used(vm, i))
-			return (int) i;
-
-	return -1;
 }
 
 /* First free RAM slot, or -1 if the table is full */
@@ -623,6 +604,22 @@ static inline int __smolkvm_gdb_stub_pkt_unpack(const unsigned char *raw,
 
 /* mmio handling */
 #ifdef SMOLKVM_FOLD
+
+static inline bool __smolkvm_mmio_slot_used(const struct smolkvm_vm *vm, unsigned int slot)
+{
+	return vm->mmioregions[slot] != NULL;
+}
+
+static inline int __smolkvm_find_free_mmio_slot(const struct smolkvm_vm *vm)
+{
+	unsigned int i;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->mmioregions); i++)
+		if (!__smolkvm_mmio_slot_used(vm, i))
+			return (int) i;
+
+	return -1;
+}
 
 #define __smolkvm_foreach_mmio(_vm, __mmio) \
 	for (__mmio = &(_vm)->mmioregions[0]; \
@@ -991,10 +988,16 @@ static inline int __smolkvm_gdb_stub_accept(struct smolkvm_vm *vm)
 	int conn_socket;
 	int ret;
 
-	ret = accept4(listen_socket, (struct sockaddr *)&client_addr, &addr_len, O_NONBLOCK);
-	if (ret < 0) {
-		printf("accept failed: %d, errno %d\n", ret, errno);
-		return -1;
+	while (true) {
+		ret = accept4(listen_socket, (struct sockaddr *)&client_addr, &addr_len, O_NONBLOCK);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+
+			printf("accept failed: %d, errno %d\n", ret, errno);
+			return -errno;
+		}
+		break;
 	}
 
 	conn_socket = ret;
