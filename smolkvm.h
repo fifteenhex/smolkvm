@@ -585,7 +585,7 @@ static inline int __smolkvm_gdb_stub_pkt_unpack(const unsigned char *raw,
 static inline void __smolkvm_plugin_mmio(struct smolkvm_vm *vm, const struct smolkvm_mmio *mmio)
 {
 	__smolkvm_debug("Plugging in MMIO device \'%s\' to slot %d\n",
-			vm->mmio_plugged_in, mmio->name);
+			mmio->name, vm->mmio_plugged_in);
 
 	vm->mmioregions[vm->mmio_plugged_in++] = mmio;
 }
@@ -594,9 +594,9 @@ static inline int __smolkvm_find_mmio_device(const struct smolkvm_vm *vm, uint64
 {
 	int i;
 
-	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->mmioregions); i++) {
+	for (i = 0; i < (int) vm->mmio_plugged_in; i++) {
 		struct smolkvm_mmio *mmio = vm->mmioregions[i];
-		if ((addr >= mmio->phys) && (addr < (mmio->phys + mmio->phys)))
+		if ((addr >= mmio->phys) && (addr < (mmio->phys + mmio->len)))
 			return i;
 	}
 
@@ -640,8 +640,8 @@ static inline int __smolkvm_handle_mmio(struct smolkvm_vm *vm)
 		int i;
 
 		/* Pack the data into a u64, I might regret this later :/ */
-		for (i = 0; i < sizeof(run->mmio.data); i++)
-		    val |= (run->mmio.data[i] << (i * 8));
+		for (i = 0; i < (int) len && i < sizeof(run->mmio.data); i++)
+		    val |= ((uint64_t) run->mmio.data[i]) << (i * 8);
 
 		mmio->write(vm, mmio, offset, len, val);
 	}
@@ -650,7 +650,8 @@ static inline int __smolkvm_handle_mmio(struct smolkvm_vm *vm)
 		int i;
 
 		val = mmio->read(vm, mmio, offset, len);
-		run->mmio.data[0] = val & 0xff;
+		for (i = 0; i < (int) len && i < sizeof(run->mmio.data); i++)
+			run->mmio.data[i] = (val >> (i * 8)) & 0xff;
 	}
 
 	return 0;
@@ -1578,6 +1579,202 @@ void smolkvm_dump_memory_map(const struct smolkvm_vm *vm)
 #endif
 /* -- */
 
+/* Adding RAM to a running guest */
+#ifdef SMOLKVM_FOLD
+
+/*
+ * Allocate `size` bytes of host memory and plug it into the guest at guest
+ * physical address `gpa` as a fresh KVM memslot. This is the low level "add
+ * memory" primitive: it makes the GPA range *backable*, but the guest still
+ * needs page tables covering it before it can actually touch the range.
+ */
+int smolkvm_map_memory(struct smolkvm_vm *vm, uint64_t gpa, uint64_t size)
+{
+	struct kvm_userspace_memory_region *memory_region;
+	unsigned int slot;
+	void *memory;
+	int ret;
+
+	if (vm->memory_region_plugged_in >= SMOLKVM_ARRAYSIZE(vm->memregions)) {
+		printf("no free memory slots, cannot map 0x%llx bytes at 0x%llx\n",
+			   (unsigned long long) size, (unsigned long long) gpa);
+		return -1;
+	}
+
+	/* KVM requires the size to be a non-zero multiple of the page size */
+	if (size == 0 || (size & (SMOLKVM_SZ_4K - 1))) {
+		printf("size 0x%llx is not a non-zero multiple of page size\n",
+			   (unsigned long long) size);
+		return -1;
+	}
+
+	memory = mmap(NULL, size, PROT_READ | PROT_WRITE,
+				  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (memory == MAP_FAILED) {
+		printf("failed to mmap 0x%llx bytes of guest memory\n",
+			   (unsigned long long) size);
+		return -1;
+	}
+
+	memset(memory, 0, size);
+
+	/* todo fix this to find an unplugged slot */
+	slot = vm->memory_region_plugged_in;
+	memory_region = &vm->memregions[slot];
+
+	memory_region->slot = slot;
+	memory_region->guest_phys_addr = gpa;
+	memory_region->memory_size = size;
+	memory_region->userspace_addr = (uint64_t) memory;
+
+	ret = __smolkvm_setmemory(vm, slot);
+	if (ret) {
+		printf("KVM_SET_USER_MEMORY_REGION failed for slot %u\n", slot);
+		munmap(memory, size);
+		return -1;
+	}
+
+	vm->memory_region_plugged_in++;
+
+	__smolkvm_debug("mapped 0x%llx bytes at gpa 0x%016llx (slot %u, host %p)\n",
+					(unsigned long long) size, (unsigned long long) gpa, slot, memory);
+
+	return 0;
+}
+
+#endif
+/* -- */
+
+/* Mailbox device: guest -> host command channel */
+#ifdef SMOLKVM_FOLD
+
+/*
+ * A tiny MMIO "mailbox" the guest uses to ask the host to do things. The guest
+ * writes the arguments, then writes a command code to the COMMAND register,
+ * which runs the command synchronously (we are inside the MMIO write VMEXIT).
+ * The result is then readable from the STATUS register.
+ *
+ * Register map (all registers are 64-bit):
+ *   0x00  COMMAND  (write)  writing here runs the command in the value
+ *   0x08  STATUS   (read)   result of the last command, 0 == OK
+ *   0x10  ARG0     (r/w)
+ *   0x18  ARG1     (r/w)
+ */
+#define SMOLKVM_MAILBOX_PHYS	0x2000
+#define SMOLKVM_MAILBOX_LEN	0x20
+
+#define __SMOLKVM_MAILBOX_REG_COMMAND	0x00
+#define __SMOLKVM_MAILBOX_REG_STATUS	0x08
+#define __SMOLKVM_MAILBOX_REG_ARG0	0x10
+#define __SMOLKVM_MAILBOX_REG_ARG1	0x18
+
+/* Commands the guest can write to the COMMAND register */
+enum smolkvm_mailbox_command {
+	SMOLKVM_MAILBOX_CMD_NOP		= 0,
+	SMOLKVM_MAILBOX_CMD_MAP_MEMORY	= 1,	/* map ARG1 bytes of RAM at gpa ARG0 */
+};
+
+/* STATUS values */
+#define SMOLKVM_MAILBOX_STATUS_OK	0
+#define SMOLKVM_MAILBOX_STATUS_ERR	1
+#define SMOLKVM_MAILBOX_STATUS_BADCMD	2
+
+struct __smolkvm_mailbox_priv {
+	uint64_t arg0;
+	uint64_t arg1;
+	uint64_t status;
+};
+
+static struct __smolkvm_mailbox_priv __smolkvm_mailbox_priv;
+
+static uint64_t __smolkvm_mailbox_dispatch(struct smolkvm_vm *vm,
+										   struct __smolkvm_mailbox_priv *mb,
+										   uint64_t command)
+{
+	int ret;
+
+	switch (command) {
+	case SMOLKVM_MAILBOX_CMD_NOP:
+		return SMOLKVM_MAILBOX_STATUS_OK;
+	case SMOLKVM_MAILBOX_CMD_MAP_MEMORY:
+		__smolkvm_debug("mailbox: MAP_MEMORY gpa 0x%016llx size 0x%llx\n",
+						(unsigned long long) mb->arg0,
+						(unsigned long long) mb->arg1);
+		ret = smolkvm_map_memory(vm, mb->arg0, mb->arg1);
+		return ret ? SMOLKVM_MAILBOX_STATUS_ERR : SMOLKVM_MAILBOX_STATUS_OK;
+	default:
+		printf("mailbox: unknown command %llu\n", (unsigned long long) command);
+		return SMOLKVM_MAILBOX_STATUS_BADCMD;
+	}
+}
+
+static void __smolkvm_mailbox_write(struct smolkvm_vm *vm,
+									struct smolkvm_mmio *mmio,
+									uint64_t offset,
+									uint8_t len,
+									uint64_t value)
+{
+	struct __smolkvm_mailbox_priv *mb = mmio->priv;
+
+	switch (offset) {
+	case __SMOLKVM_MAILBOX_REG_ARG0:
+		mb->arg0 = value;
+		break;
+	case __SMOLKVM_MAILBOX_REG_ARG1:
+		mb->arg1 = value;
+		break;
+	case __SMOLKVM_MAILBOX_REG_COMMAND:
+		mb->status = __smolkvm_mailbox_dispatch(vm, mb, value);
+		break;
+	default:
+		__smolkvm_debug("mailbox: write to unknown offset 0x%llx\n",
+						(unsigned long long) offset);
+		break;
+	}
+}
+
+static uint64_t __smolkvm_mailbox_read(struct smolkvm_vm *vm,
+									   struct smolkvm_mmio *mmio,
+									   uint64_t offset,
+									   uint8_t len)
+{
+	struct __smolkvm_mailbox_priv *mb = mmio->priv;
+
+	switch (offset) {
+	case __SMOLKVM_MAILBOX_REG_STATUS:
+		return mb->status;
+	case __SMOLKVM_MAILBOX_REG_ARG0:
+		return mb->arg0;
+	case __SMOLKVM_MAILBOX_REG_ARG1:
+		return mb->arg1;
+	}
+
+	return 0;
+}
+
+static struct smolkvm_mmio __smolkvm_mailbox = {
+	.name = "mailbox",
+	.phys = SMOLKVM_MAILBOX_PHYS,
+	.len = SMOLKVM_MAILBOX_LEN,
+	.write = __smolkvm_mailbox_write,
+	.read = __smolkvm_mailbox_read,
+	.priv = &__smolkvm_mailbox_priv,
+};
+
+static inline int __smolkvm_mailbox_create(struct smolkvm_vm *vm)
+{
+	__smolkvm_mailbox_priv.arg0 = 0;
+	__smolkvm_mailbox_priv.arg1 = 0;
+	__smolkvm_mailbox_priv.status = 0;
+
+	__smolkvm_plugin_mmio(vm, &__smolkvm_mailbox);
+
+	return 0;
+}
+
+#endif
+/* -- */
+
 /* ELF loading */
 #ifdef SMOLKVM_FOLD
 
@@ -1708,6 +1905,7 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 	vm->vcpu_run->kvm_valid_regs = KVM_SYNC_X86_REGS | KVM_SYNC_X86_SREGS;
 
 	/* Fill in the initial memory region */
+	memory_region->slot = 0;
 	memory_region->guest_phys_addr = SMOLKVM_BASEMEMORY_PHYS_START;
 	memory_region->memory_size = SMOLKVM_BASEMEMORY_SZ;
 	memory_region->userspace_addr = (uint64_t)memory;
@@ -1738,6 +1936,9 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 
 	/* Plug in the console .. boop beep boop */
 	__smolkvm_console_create(vm);
+
+	/* Plug in the mailbox so the guest can ask us to do things */
+	__smolkvm_mailbox_create(vm);
 
 	return 0;
 }
