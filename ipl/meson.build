@@ -4,6 +4,8 @@ picolibc = subproject('picolibc', default_options: [ 'multilib=false', 'semihost
 
 picolibc_dep = picolibc.get_variable('picolibc_dep')
 
+inc = include_directories('include')
+
 executable(
     'ipl',
     [ 'start.S', 'main.c', 'stdio.c' ] ,
@@ -13,4 +15,5 @@ executable(
     ],
     dependencies: picolibc_dep,
     link_depends: 'linker.ld',
+    include_directories : inc,
 )

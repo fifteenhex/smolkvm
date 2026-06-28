@@ -1,20 +1,30 @@
 #include "smolkvm.h"
+#include "ipl/include/params.h"
 
 #define MAILBOX_CMD_GETPARAMS (SMOLKVM_MAILBOX_CMD_MINUSER + 0)
+#define MAILBOX_CMD_LOADKERNEL (SMOLKVM_MAILBOX_CMD_MINUSER + 1)
 
 struct cmd_buffer_getparams {
 	uint64_t gpa;
 	uint64_t size;
 };
 
-static uint64_t get_params_fn(struct smolkvm_vm *vm, uint64_t command, void *buffer, void *priv) {
+static uint64_t get_params_fn(struct smolkvm_vm *vm, uint64_t command, void *buffer, void *priv)
+{
+	printf("Guest asked for parameters\n");
+	return 0;
+}
 
+static uint64_t load_kernel_fn(struct smolkvm_vm *vm, uint64_t command, void *buffer, void *priv)
+{
+	printf("Guest asked for kernel to be loaded\n");
 	return 0;
 }
 
 int main(int argc, char **argv, char **envp)
 {
 	struct cmd_buffer_getparams getparams = { 0 };
+	struct cmd_buffer_getparams loadkernelparams = { 0 };
 	struct smolkvm_vm vm = { 0 };
 	int ret;
 
@@ -27,7 +37,12 @@ int main(int argc, char **argv, char **envp)
 	}
 
 	ret = smolkvm_mailbox_register(&vm, MAILBOX_CMD_GETPARAMS, &getparams,
-				     sizeof(getparams), get_params_fn, NULL);
+				       sizeof(getparams), get_params_fn, NULL);
+	if (ret)
+		return 1;
+
+	ret = smolkvm_mailbox_register(&vm, MAILBOX_CMD_LOADKERNEL, &loadkernelparams,
+				       sizeof(loadkernelparams), load_kernel_fn, NULL);
 	if (ret)
 		return 1;
 

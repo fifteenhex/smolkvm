@@ -1803,9 +1803,7 @@ int smolkvm_map_memory(struct smolkvm_vm *vm, uint64_t gpa, uint64_t size)
  *   [47:0]  guest ptr (48 bits -- the x86-64 canonical boundary, so a tagged
  *                      value is non-canonical and can't collide with a real VA)
  */
-#ifndef SMOLKVM_MAILBOX_CMD_SHIFT
 #define SMOLKVM_MAILBOX_CMD_SHIFT	48
-#endif
 #define SMOLKVM_MAILBOX_FLAGS_BITS	4
 #define SMOLKVM_MAILBOX_FLAGS_SHIFT	(64 - SMOLKVM_MAILBOX_FLAGS_BITS)
 #define SMOLKVM_MAILBOX_FLAGS_MASK	((1ULL << SMOLKVM_MAILBOX_FLAGS_BITS) - 1)
