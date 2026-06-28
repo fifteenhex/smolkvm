@@ -1533,6 +1533,8 @@ static inline void __smolkvm_gdb_stub_stop(struct smolkvm_vm *vm)
 #define SMOLKVM_BASEMEMORY_PHYS_END   (SMOLKVM_BASEMEMORY_PHYS_START + SMOLKVM_BASEMEMORY_SZ)
 #define SMOLKVM_PAGETABLE_OFF         (SMOLKVM_BASEMEMORY_SZ - (SMOLKVM_SZ_4K * 4))
 #define SMOLKVM_PAGETABLE_PHYS        (SMOLKVM_BASEMEMORY_PHYS_END - (SMOLKVM_SZ_4K * 4))
+#define SMOLKVM_PAGETABLE_PDPT_PHYS   (SMOLKVM_PAGETABLE_PHYS + SMOLKVM_SZ_4K)
+#define SMOLKVM_PAGETABLE_PD_PHYS     (SMOLKVM_PAGETABLE_PHYS + (SMOLKVM_SZ_4K * 2))
 
 static inline void __smolkvm_create_initial_pagetables(struct smolkvm_vm *vm)
 {
@@ -1551,9 +1553,9 @@ static inline void __smolkvm_create_initial_pagetables(struct smolkvm_vm *vm)
 	__smolkvm_debug("Page tables phy 0x%016llx, offset 0x%016llx\n",
 	       SMOLKVM_PAGETABLE_PHYS, SMOLKVM_PAGETABLE_OFF);
 
-	*root  = SMOLKVM_PTE_ADDR(SMOLKVM_PAGETABLE_PHYS + SMOLKVM_SZ_4K)
+	*root  = SMOLKVM_PTE_ADDR(SMOLKVM_PAGETABLE_PDPT_PHYS)
 	       | SMOLKVM_PTE_RW | SMOLKVM_PTE_PRESENT;
-	*onegb = SMOLKVM_PTE_ADDR(SMOLKVM_PAGETABLE_PHYS + (SMOLKVM_SZ_4K * 2))
+	*onegb = SMOLKVM_PTE_ADDR(SMOLKVM_PAGETABLE_PD_PHYS)
 	       | SMOLKVM_PTE_RW | SMOLKVM_PTE_PRESENT;
 	*mmio  = SMOLKVM_PTE_ADDR(0)
 	       | SMOLKVM_PTE_PS | SMOLKVM_PTE_RW | SMOLKVM_PTE_PRESENT;
@@ -1829,6 +1831,15 @@ void smolkvm_dump_register_header(const struct smolkvm_vm *vm, FILE *out)
 
 		fprintf(out, "\n");
 	}
+
+	fprintf(out, "/* guest page tables: identity map, 2MB huge pages, PD spans the first 1GB; CR3 = PML4 */\n");
+	fprintf(out, "#define %-40s 0x%016llxULL\n", "SMOLKVM_PAGETABLE_PML4",
+		(unsigned long long) SMOLKVM_PAGETABLE_PHYS);
+	fprintf(out, "#define %-40s 0x%016llxULL\n", "SMOLKVM_PAGETABLE_PDPT",
+		(unsigned long long) SMOLKVM_PAGETABLE_PDPT_PHYS);
+	fprintf(out, "#define %-40s 0x%016llxULL\n", "SMOLKVM_PAGETABLE_PD",
+		(unsigned long long) SMOLKVM_PAGETABLE_PD_PHYS);
+	fprintf(out, "\n");
 
 #ifdef SMOLKVM_WANT_APIC
 	fprintf(out, "/* in-kernel APIC + IOAPIC (emulated by KVM, for the MADT) */\n");
