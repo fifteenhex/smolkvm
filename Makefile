@@ -11,12 +11,15 @@ COPTS= -ggdb \
 
 IPL=ipl/build/ipl
 
+ipl/include/machine.h: smolkvm_test_libc
+	smolkvm_test_libc -h $@
+
 .PHONY: $(IPL)
-$(IPL):
+$(IPL): ipl/include/machine.h
 	$(MAKE) -C ipl/
 
 ifdef NOLIBCDIR
-all: smolkvm_test smolkvm_test_gdb
+all: smolkvm_test smolkvm_test_gdb $(IPL)
 
 smolkvm_test: smolkvm_test.c smolkvm.h $(IPL)
 	$(CC) -nostdlib -include $(NOLIBCDIR)/nolibc.h $(COPTS) -static -o $@ $< -lgcc
@@ -29,17 +32,17 @@ $(warning Please pass NOLIBCDIR with the path to your copy of nolibc (tools/incl
 endif
 
 
-smolkvm_test_libc: smolkvm_test.c smolkvm.h $(IPL)
+smolkvm_test_libc: smolkvm_test.c smolkvm.h
 	$(CC) $(COPTS) -o $@ $<
 
-smolkvm_test_debug_libc: smolkvm_test.c smolkvm.h $(IPL)
+smolkvm_test_debug_libc: smolkvm_test.c smolkvm.h
 	$(CC) $(COPTS) -DSMOLKVM_DEBUG -o $@ $<
 
-smolkvm_test_gdb_libc: smolkvm_test.c smolkvm.h $(IPL)
+smolkvm_test_gdb_libc: smolkvm_test.c smolkvm.h
 	$(CC) -DSMOLKVM_WANT_GDB_STUB -DSMOLKVM_WANT_GDB_STUB_DEBUG $(COPTS) -o $@ $<
 
 
-smolkvm_test_debug_gdb_libc: smolkvm_test.c smolkvm.h $(IPL)
+smolkvm_test_debug_gdb_libc: smolkvm_test.c smolkvm.h
 	$(CC) -DSMOLKVM_DEBUG -DSMOLKVM_WANT_GDB_STUB -DSMOLKVM_WANT_GDB_STUB_DEBUG $(COPTS) -o $@ $<
 
 .PHONY: clean

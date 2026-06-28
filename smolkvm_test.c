@@ -25,17 +25,25 @@ static uint64_t load_kernel_fn(struct smolkvm_vm *vm, uint64_t command, void *bu
 
 int main(int argc, char **argv, char **envp)
 {
-	struct cmd_buffer_getparams getparams = { 0 };
 	struct cmd_buffer_getparams loadkernelparams = { 0 };
-	struct smolkvm_vm vm = { 0 };
+	struct cmd_buffer_getparams getparams = { 0 };
+	const char *ipl_path = "ipl/build/ipl";
+	const char *kernel_path = NULL;
 	const char *header_path = NULL;
+	struct smolkvm_vm vm = { 0 };
 	int ret;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "h:")) != -1) {
+	while ((opt = getopt(argc, argv, "h:i:k:")) != -1) {
 		switch (opt) {
 		case 'h':
 			header_path = optarg;
+			break;
+		case 'i':
+			ipl_path = optarg;
+			break;
+		case 'k':
+			kernel_path = optarg;
 			break;
 		default:
 			fprintf(stderr, "usage: %s [-h header_out]\n", argv[0]);
@@ -77,7 +85,7 @@ int main(int argc, char **argv, char **envp)
 
 	smolkvm_dump_memory_map(&vm);
 
-	ret = smolkvm_load_elf_file(&vm, "ipl/build/ipl");
+	ret = smolkvm_load_elf_file(&vm, ipl_path);
 
 #ifdef SMOLKVM_WANT_GDB_STUB
 	__smolkvm_gdb_stub_start(&vm);
