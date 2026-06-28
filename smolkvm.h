@@ -108,6 +108,8 @@
 #define SMOLKVM_ERR_CREATE_SETREGS  111
 #define SMOLKVM_ERR_MMIO_NO_DEVICE  112
 #define SMOLKVM_ERR_UNHANDLED_EXIT  113
+#define SMOLKVM_ERR_GET_CPUID       114
+#define SMOLKVM_ERR_SET_CPUID       115
 
 #endif
 /* -- */
@@ -2646,6 +2648,44 @@ int smolkvm_load_elf_file(struct smolkvm_vm *vm, const char *elf_path, uint64_t 
 /* VM creation and teardown */
 #ifdef SMOLKVM_FOLD
 
+/*
+ * Tell the guest what the CPU can do. KVM hands a vCPU a near-empty CPUID by
+ * default; we pass through whatever the host KVM says it can support. This is
+ * harmless for the bare-metal IPL (which never consults CPUID) but mandatory
+ * for an OS like Linux that feature-probes heavily.
+ */
+#define SMOLKVM_CPUID_MAX_ENTRIES 256
+
+static int __smolkvm_setup_cpuid(struct smolkvm_vm *vm)
+{
+	struct kvm_cpuid2 *cpuid;
+	int ret;
+
+	cpuid = calloc(1, sizeof(*cpuid) +
+		       SMOLKVM_CPUID_MAX_ENTRIES * sizeof(struct kvm_cpuid_entry2));
+	if (!cpuid)
+		return -SMOLKVM_ERR_ALLOCMEMORY;
+
+	cpuid->nent = SMOLKVM_CPUID_MAX_ENTRIES;
+
+	ret = ioctl(vm->kvm_fd, KVM_GET_SUPPORTED_CPUID, cpuid);
+	if (ret < 0) {
+		__smolkvm_debug("KVM_GET_SUPPORTED_CPUID failed: %d\n", ret);
+		free(cpuid);
+		return -SMOLKVM_ERR_GET_CPUID;
+	}
+
+	ret = ioctl(vm->vcpu_fd, KVM_SET_CPUID2, cpuid);
+	if (ret < 0) {
+		__smolkvm_debug("KVM_SET_CPUID2 failed: %d\n", ret);
+		free(cpuid);
+		return -SMOLKVM_ERR_SET_CPUID;
+	}
+
+	free(cpuid);
+	return 0;
+}
+
 int smolkvm_create_vm(struct smolkvm_vm *vm)
 {
 	struct kvm_userspace_memory_region *memory_region = &vm->memregions[0];
@@ -2711,6 +2751,11 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 
 	/* Create the initial page tables */
 	__smolkvm_create_initial_pagetables(vm);
+
+	/* Advertise CPU features to the guest before the first run */
+	ret = __smolkvm_setup_cpuid(vm);
+	if (ret)
+		return ret;
 
 	/* Looks like KVM is ready to go. Setup the CPU */
 	ret = __smolkvm_switch_cpu_into_longmode(vm);
