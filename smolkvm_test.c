@@ -9,7 +9,16 @@
 
 static uint64_t get_params_fn(struct smolkvm_vm *vm, uint64_t command, void *buffer, void *priv)
 {
+	struct cmd_buffer_getparams *getparams = buffer;
+	struct ipl_params params = { };
+
+
 	printf("Guest asked for parameters\n");
+	params.ram_base = 0x400000;
+	params.ram_sz = 0x4000000;
+
+	smolkvm_guest_write(vm, getparams->params_ptr, sizeof(params), &params);
+
 	return 0;
 }
 

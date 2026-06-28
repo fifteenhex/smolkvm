@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 struct cmd_buffer_getparams {
-	uint64_t gpa;
+	uint64_t params_ptr;
 	uint64_t size;
 };
 

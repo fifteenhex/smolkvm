@@ -22,7 +22,7 @@ struct XSDP {
 } __attribute__ ((packed));
 
 static struct XSDP rsdp = {
-}
+};
 
 static struct boot_params linux_boot_params = { 0 };
 
@@ -46,21 +46,24 @@ static void jump_to_kernel(uint64_t entry, struct boot_params *params)
 
 void _c_start(void)
 {
-	struct smolkvm_mailbox_map_memory sysramcmd = {
-		.gpa = 0x400000,
-		.size = 0x4000000,
-	};
+	struct smolkvm_mailbox_map_memory sysramcmd = { 0 };
 	uint64_t kernel_entry;
+	struct cmd_buffer_getparams getparams = {
+		.params_ptr = (uint64_t) &ipl_params,
+		.size = sizeof(ipl_params),
+	};
 	struct cmd_buf_loadkernel loadkernel = {
 		.entry_ptr = (uint64_t) &kernel_entry,
 	};
 
 	printf("smolkvm test vm IPL\n");
 
-	mailbox_post(SMOLKVM_MAILBOX_CMD_GETPARAMS, &ipl_params);
+	mailbox_post(SMOLKVM_MAILBOX_CMD_GETPARAMS, &getparams);
+	printf("RAM 0x%lx @ 0x%lx\n", ipl_params.ram_sz, ipl_params.ram_base);
 
 	printf("Asking for system RAM\n");
-
+	sysramcmd.gpa = ipl_params.ram_base;
+	sysramcmd.size = ipl_params.ram_sz;
 	mailbox_post(SMOLKVM_MAILBOX_CMD_MAP_MEMORY, &sysramcmd);
 
 	printf("Asking for kernel load\n");
