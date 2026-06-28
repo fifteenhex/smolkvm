@@ -1,6 +1,8 @@
 #include "smolkvm.h"
 #include "ipl/include/params.h"
 
+#include <unistd.h>
+
 #define MAILBOX_CMD_GETPARAMS (SMOLKVM_MAILBOX_CMD_MINUSER + 0)
 #define MAILBOX_CMD_LOADKERNEL (SMOLKVM_MAILBOX_CMD_MINUSER + 1)
 
@@ -26,7 +28,20 @@ int main(int argc, char **argv, char **envp)
 	struct cmd_buffer_getparams getparams = { 0 };
 	struct cmd_buffer_getparams loadkernelparams = { 0 };
 	struct smolkvm_vm vm = { 0 };
+	const char *header_path = NULL;
 	int ret;
+	int opt;
+
+	while ((opt = getopt(argc, argv, "h:")) != -1) {
+		switch (opt) {
+		case 'h':
+			header_path = optarg;
+			break;
+		default:
+			fprintf(stderr, "usage: %s [-h header_out]\n", argv[0]);
+			return 1;
+		}
+	}
 
 	printf("Built %s @ %s\n", __DATE__, __TIME__);
 
@@ -34,6 +49,20 @@ int main(int argc, char **argv, char **envp)
 	if (ret) {
 		printf("smolkvm_create_vm() failed: %d\n", ret);
 		return 1;
+	}
+
+	if (header_path) {
+		FILE *header = fopen(header_path, "w");
+		if (!header) {
+			fprintf(stderr, "could not open %s for writing\n", header_path);
+			smolkvm_destroy_vm(&vm);
+			return 1;
+		}
+
+		smolkvm_dump_register_header(&vm, header);
+		fclose(header);
+		smolkvm_destroy_vm(&vm);
+		return 0;
 	}
 
 	ret = smolkvm_mailbox_register(&vm, MAILBOX_CMD_GETPARAMS, &getparams,

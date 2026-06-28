@@ -3,16 +3,18 @@
 #include <unistd.h>
 #include <stdint.h>
 
-static volatile uint8_t *rxd = (void *) 0x1000;
+#include "machine.h"
+
+static volatile uint8_t *txrx= (void *) SMOLKVM_CONSOLE_TXRX;
 
 static int smolkvm_putc(char c, FILE *file)
 {
 	(void) file;
 
 	if (c == '\n')
-		*rxd = '\r';
+		*txrx = '\r';
 
-	*rxd = c;
+	*txrx = c;
 
 	return c;
 }
