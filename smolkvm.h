@@ -66,6 +66,10 @@
 #define SMOLKVM_MMIOREGIONS_NUM	8
 #endif
 
+#ifndef SMOLKVM_MAILBOX_HANDLERS_NUM
+#define SMOLKVM_MAILBOX_HANDLERS_NUM	16
+#endif
+
 /*
  * The simple polled interrupt controller + timer MMIO devices, for bare-metal
  * guests. On by default; define SMOLKVM_NO_SIMPLE_DEVICES to leave them out
@@ -994,6 +998,22 @@ static inline int __smolkvm_memory_write(const struct smolkvm_vm *vm, uint64_t a
 	return 0;
 }
 
+/*
+ * Public guest-memory helpers for host code (e.g. mailbox handlers placing a
+ * response at a guest pointer carried in the command buffer). `gpa` is a
+ * guest-physical address; both return 0 on success, -1 if the range isn't
+ * inside a mapped region.
+ */
+int smolkvm_guest_read(struct smolkvm_vm *vm, uint64_t gpa, uint64_t len, void *dst)
+{
+	return __smolkvm_memory_read(vm, gpa, len, dst);
+}
+
+int smolkvm_guest_write(struct smolkvm_vm *vm, uint64_t gpa, uint64_t len, const void *src)
+{
+	return __smolkvm_memory_write(vm, gpa, len, src);
+}
+
 #endif
 /* -- */
 
@@ -1751,104 +1771,201 @@ int smolkvm_map_memory(struct smolkvm_vm *vm, uint64_t gpa, uint64_t size)
 
 /*
  * A tiny MMIO "mailbox" the guest uses to ask the host to do things. The guest
- * writes the arguments, then writes a command code to the COMMAND register,
- * which runs the command synchronously (we are inside the MMIO write VMEXIT).
- * The result is then readable from the STATUS register.
+ * submits a command as a single tagged-pointer write, then reads STATUS to see
+ * the result. Submission runs synchronously (we are inside the MMIO write
+ * VMEXIT).
  *
- * Register map (all registers are 64-bit):
- *   0x00  COMMAND  (write)  writing here runs the command in the value
- *   0x08  STATUS   (read)   result of the last command, 0 == OK
- *   0x10  ARG0     (r/w)
- *   0x18  ARG1     (r/w)
+ * Register map (all registers are 64-bit). SUBMIT and STATUS share one packed
+ * layout: [63:60] flags, [59:48] command, [47:0] guest pointer.
+ *   0x00  SUBMIT  (write)  (flags << 60) | (command << 48) | guest_ptr -- runs
+ *                          `command` against the buffer at guest_ptr. Flag bit
+ *                          ASYNC marks that the guest accepts an async reply.
+ *   0x08  STATUS  (read)   the command + pointer currently/last processed, with
+ *                          flag bits DONE and SUCCESS in the top 4 bits.
  */
 #define SMOLKVM_MAILBOX_PHYS	0x2000
-#define SMOLKVM_MAILBOX_LEN	0x20
+#define SMOLKVM_MAILBOX_LEN	0x10
 
-#define __SMOLKVM_MAILBOX_REG_COMMAND	0x00
+#define __SMOLKVM_MAILBOX_REG_SUBMIT	0x00
 #define __SMOLKVM_MAILBOX_REG_STATUS	0x08
-#define __SMOLKVM_MAILBOX_REG_ARG0	0x10
-#define __SMOLKVM_MAILBOX_REG_ARG1	0x18
 
-/* Commands the guest can write to the COMMAND register */
+/*
+ * SUBMIT and STATUS share one 64-bit layout:
+ *   [63:60] flags     (4 bits)
+ *   [59:48] command   (12 bits)
+ *   [47:0]  guest ptr (48 bits -- the x86-64 canonical boundary, so a tagged
+ *                      value is non-canonical and can't collide with a real VA)
+ */
+#ifndef SMOLKVM_MAILBOX_CMD_SHIFT
+#define SMOLKVM_MAILBOX_CMD_SHIFT	48
+#endif
+#define SMOLKVM_MAILBOX_FLAGS_BITS	4
+#define SMOLKVM_MAILBOX_FLAGS_SHIFT	(64 - SMOLKVM_MAILBOX_FLAGS_BITS)
+#define SMOLKVM_MAILBOX_FLAGS_MASK	((1ULL << SMOLKVM_MAILBOX_FLAGS_BITS) - 1)
+#define SMOLKVM_MAILBOX_CMD_MASK	((1ULL << (SMOLKVM_MAILBOX_FLAGS_SHIFT - SMOLKVM_MAILBOX_CMD_SHIFT)) - 1)
+#define SMOLKVM_MAILBOX_PTR_MASK	((1ULL << SMOLKVM_MAILBOX_CMD_SHIFT) - 1)
+
+/* Decode any SUBMIT/STATUS value into its fields */
+#define SMOLKVM_MAILBOX_GET_FLAGS(v)	(((v) >> SMOLKVM_MAILBOX_FLAGS_SHIFT) & SMOLKVM_MAILBOX_FLAGS_MASK)
+#define SMOLKVM_MAILBOX_GET_CMD(v)	(((v) >> SMOLKVM_MAILBOX_CMD_SHIFT) & SMOLKVM_MAILBOX_CMD_MASK)
+#define SMOLKVM_MAILBOX_GET_PTR(v)	((v) & SMOLKVM_MAILBOX_PTR_MASK)
+
+/* SUBMIT flags (top 4 bits of a submission) */
+#define SMOLKVM_MAILBOX_FLAG_ASYNC	(1ULL << 0)	/* guest accepts an async reply */
+
+/* STATUS flags (top 4 bits of the status register) */
+#define SMOLKVM_MAILBOX_DONE		(1ULL << 0)	/* the shown command has finished */
+#define SMOLKVM_MAILBOX_SUCCESS		(1ULL << 1)	/* ...and finished successfully */
+
+/* Built-in commands */
 enum smolkvm_mailbox_command {
 	SMOLKVM_MAILBOX_CMD_NOP		= 0,
-	SMOLKVM_MAILBOX_CMD_MAP_MEMORY	= 1,	/* map ARG1 bytes of RAM at gpa ARG0 */
+	SMOLKVM_MAILBOX_CMD_MAP_MEMORY	= 1,	/* buffer: struct smolkvm_mailbox_map_memory */
 };
 
-/* STATUS values */
+/* Command buffer for SMOLKVM_MAILBOX_CMD_MAP_MEMORY */
+struct smolkvm_mailbox_map_memory {
+	uint64_t gpa;
+	uint64_t size;
+};
+
+/*
+ * Handler return codes (distinct from the packed STATUS register). PENDING
+ * means the handler took ownership of the request and will finish it later via
+ * smolkvm_mailbox_complete().
+ */
 #define SMOLKVM_MAILBOX_STATUS_OK	0
 #define SMOLKVM_MAILBOX_STATUS_ERR	1
 #define SMOLKVM_MAILBOX_STATUS_BADCMD	2
+#define SMOLKVM_MAILBOX_STATUS_PENDING	3
+
+/*
+ * Host-registered command handlers. A program embedding smolkvm registers a
+ * callback for a command number with smolkvm_mailbox_register(); when the guest
+ * submits that command, the callback runs synchronously with the decoded guest
+ * pointer, and whatever it returns becomes STATUS.
+ */
+typedef uint64_t (*smolkvm_mailbox_handler_fn)(struct smolkvm_vm *vm,
+		uint64_t command, void *buffer, void *priv);
+
+struct smolkvm_mailbox_handler {
+	bool used;
+	uint64_t command;
+	void *buffer;		/* host buffer the message is copied into */
+	size_t buffer_size;	/* bytes to copy from the guest pointer */
+	smolkvm_mailbox_handler_fn fn;
+	void *priv;
+};
 
 struct __smolkvm_mailbox_priv {
-	uint64_t arg0;
-	uint64_t arg1;
-	uint64_t status;
+	uint64_t status;		/* packed (flags, command, ptr) the guest reads */
+	uint64_t inflight_command;	/* command currently being processed */
+	uint64_t inflight_ptr;		/* its guest pointer */
+	struct smolkvm_mailbox_handler handlers[SMOLKVM_MAILBOX_HANDLERS_NUM];
 };
 
 static struct __smolkvm_mailbox_priv __smolkvm_mailbox_priv;
 
-static uint64_t __smolkvm_mailbox_dispatch(struct smolkvm_vm *vm,
-					   struct __smolkvm_mailbox_priv *mb,
-					   uint64_t command)
+static struct smolkvm_mailbox_handler *
+__smolkvm_mailbox_find_handler(struct __smolkvm_mailbox_priv *mb, uint64_t command)
 {
-	int ret;
+	unsigned int i;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(mb->handlers); i++)
+		if (mb->handlers[i].used && mb->handlers[i].command == command)
+			return &mb->handlers[i];
+
+	return NULL;
+}
+
+static uint64_t __smolkvm_mailbox_pack(uint64_t flags, uint64_t command, uint64_t ptr)
+{
+	return ((flags & SMOLKVM_MAILBOX_FLAGS_MASK) << SMOLKVM_MAILBOX_FLAGS_SHIFT)
+	     | ((command & SMOLKVM_MAILBOX_CMD_MASK) << SMOLKVM_MAILBOX_CMD_SHIFT)
+	     | (ptr & SMOLKVM_MAILBOX_PTR_MASK);
+}
+
+static uint64_t __smolkvm_mailbox_dispatch(struct smolkvm_vm *vm,
+		struct __smolkvm_mailbox_priv *mb, uint64_t command, uint64_t guest_ptr)
+{
+	struct smolkvm_mailbox_handler *h;
 
 	switch (command) {
 	case SMOLKVM_MAILBOX_CMD_NOP:
 		return SMOLKVM_MAILBOX_STATUS_OK;
-	case SMOLKVM_MAILBOX_CMD_MAP_MEMORY:
+	case SMOLKVM_MAILBOX_CMD_MAP_MEMORY: {
+		struct smolkvm_mailbox_map_memory req;
+
+		if (__smolkvm_memory_read(vm, guest_ptr, sizeof(req), &req))
+			return SMOLKVM_MAILBOX_STATUS_ERR;
+
 		__smolkvm_debug("mailbox: MAP_MEMORY gpa 0x%016llx size 0x%llx\n",
-						(unsigned long long) mb->arg0,
-						(unsigned long long) mb->arg1);
-		ret = smolkvm_map_memory(vm, mb->arg0, mb->arg1);
-		return ret ? SMOLKVM_MAILBOX_STATUS_ERR : SMOLKVM_MAILBOX_STATUS_OK;
+				(unsigned long long) req.gpa, (unsigned long long) req.size);
+
+		return smolkvm_map_memory(vm, req.gpa, req.size)
+				? SMOLKVM_MAILBOX_STATUS_ERR : SMOLKVM_MAILBOX_STATUS_OK;
+	}
 	default:
+		h = __smolkvm_mailbox_find_handler(mb, command);
+		if (h) {
+			/* Copy the guest's command buffer in before calling the handler */
+			if (h->buffer_size &&
+			    __smolkvm_memory_read(vm, guest_ptr, h->buffer_size, h->buffer))
+				return SMOLKVM_MAILBOX_STATUS_ERR;
+
+			return h->fn(vm, command, h->buffer, h->priv);
+		}
+
 		printf("mailbox: unknown command %llu\n", (unsigned long long) command);
 		return SMOLKVM_MAILBOX_STATUS_BADCMD;
 	}
 }
 
 static void __smolkvm_mailbox_write(struct smolkvm_vm *vm,
-									struct smolkvm_mmio *mmio,
-									uint64_t offset,
-									uint8_t len,
-									uint64_t value)
+		struct smolkvm_mmio *mmio, uint64_t offset, uint8_t len, uint64_t value)
 {
 	struct __smolkvm_mailbox_priv *mb = mmio->priv;
 
-	switch (offset) {
-	case __SMOLKVM_MAILBOX_REG_ARG0:
-		mb->arg0 = value;
-		break;
-	case __SMOLKVM_MAILBOX_REG_ARG1:
-		mb->arg1 = value;
-		break;
-	case __SMOLKVM_MAILBOX_REG_COMMAND:
-		mb->status = __smolkvm_mailbox_dispatch(vm, mb, value);
-		break;
-	default:
-		__smolkvm_debug("mailbox: write to unknown offset 0x%llx\n",
-						(unsigned long long) offset);
-		break;
+	if (offset == __SMOLKVM_MAILBOX_REG_SUBMIT) {
+		uint64_t command   = SMOLKVM_MAILBOX_GET_CMD(value);
+		uint64_t guest_ptr = SMOLKVM_MAILBOX_GET_PTR(value);
+		uint64_t flags     = SMOLKVM_MAILBOX_GET_FLAGS(value);
+		uint64_t ret;
+
+		/* ASYNC and the other submit flags are decoded but not yet acted on */
+		(void) flags;
+
+		mb->inflight_command = command;
+		mb->inflight_ptr = guest_ptr;
+
+		ret = __smolkvm_mailbox_dispatch(vm, mb, command, guest_ptr);
+
+		if (ret == SMOLKVM_MAILBOX_STATUS_PENDING) {
+			/* Handler owns it now: show in-flight (not DONE) until
+			 * smolkvm_mailbox_complete() is called. */
+			mb->status = __smolkvm_mailbox_pack(0, command, guest_ptr);
+		} else {
+			uint64_t sf = SMOLKVM_MAILBOX_DONE;
+
+			if (ret == SMOLKVM_MAILBOX_STATUS_OK)
+				sf |= SMOLKVM_MAILBOX_SUCCESS;
+
+			mb->status = __smolkvm_mailbox_pack(sf, command, guest_ptr);
+		}
+		return;
 	}
+
+	__smolkvm_debug("mailbox: write to unknown offset 0x%llx\n",
+			(unsigned long long) offset);
 }
 
 static uint64_t __smolkvm_mailbox_read(struct smolkvm_vm *vm,
-									   struct smolkvm_mmio *mmio,
-									   uint64_t offset,
-									   uint8_t len)
+		struct smolkvm_mmio *mmio, uint64_t offset, uint8_t len)
 {
 	struct __smolkvm_mailbox_priv *mb = mmio->priv;
 
-	switch (offset) {
-	case __SMOLKVM_MAILBOX_REG_STATUS:
+	if (offset == __SMOLKVM_MAILBOX_REG_STATUS)
 		return mb->status;
-	case __SMOLKVM_MAILBOX_REG_ARG0:
-		return mb->arg0;
-	case __SMOLKVM_MAILBOX_REG_ARG1:
-		return mb->arg1;
-	}
 
 	return 0;
 }
@@ -1862,11 +1979,86 @@ static struct smolkvm_mmio __smolkvm_mailbox = {
 	.priv = &__smolkvm_mailbox_priv,
 };
 
+/*
+ * Register a host callback for a mailbox command. Call after smolkvm_create_vm.
+ * NOP (0) and MAP_MEMORY (1) are reserved built-ins and cannot be overridden.
+ */
+int smolkvm_mailbox_register(struct smolkvm_vm *vm, uint64_t command,
+		void *buffer, size_t buffer_size,
+		smolkvm_mailbox_handler_fn fn, void *priv)
+{
+	struct __smolkvm_mailbox_priv *mb = &__smolkvm_mailbox_priv;
+	unsigned int i;
+
+	(void) vm;
+
+	if (buffer_size && !buffer) {
+		printf("mailbox: command %llu has a buffer size but no buffer\n",
+		       (unsigned long long) command);
+		return -1;
+	}
+
+	if (command == SMOLKVM_MAILBOX_CMD_NOP ||
+		command == SMOLKVM_MAILBOX_CMD_MAP_MEMORY) {
+		printf("mailbox: command %llu is a reserved built-in\n",
+			   (unsigned long long) command);
+		return -1;
+	}
+
+	if (__smolkvm_mailbox_find_handler(mb, command)) {
+		printf("mailbox: command %llu already has a handler\n",
+			   (unsigned long long) command);
+		return -1;
+	}
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(mb->handlers); i++) {
+		if (!mb->handlers[i].used) {
+			mb->handlers[i].used = true;
+			mb->handlers[i].command = command;
+			mb->handlers[i].buffer = buffer;
+			mb->handlers[i].buffer_size = buffer_size;
+			mb->handlers[i].fn = fn;
+			mb->handlers[i].priv = priv;
+			return 0;
+		}
+	}
+
+	printf("mailbox: no free handler slots for command %llu\n",
+		   (unsigned long long) command);
+	return -1;
+}
+
+/*
+ * Finish an asynchronous command. A handler that returned PENDING (or a
+ * worker thread it spawned) calls this when the work is done; it marks the
+ * in-flight command DONE (and SUCCESS if `success`) in the STATUS register
+ * the guest polls.
+ *
+ * Single in-flight model: one outstanding command at a time, so the guest
+ * must observe DONE before submitting again. The 64-bit STATUS store is
+ * atomic on x86-64; completing from another thread still wants a proper
+ * release/acquire pairing with the guest's poll for full correctness.
+ */
+void smolkvm_mailbox_complete(struct smolkvm_vm *vm, bool success)
+{
+	struct __smolkvm_mailbox_priv *mb = &__smolkvm_mailbox_priv;
+	uint64_t sf = SMOLKVM_MAILBOX_DONE;
+
+	(void) vm;
+
+	if (success)
+		sf |= SMOLKVM_MAILBOX_SUCCESS;
+
+	mb->status = __smolkvm_mailbox_pack(sf, mb->inflight_command, mb->inflight_ptr);
+}
+
 static inline int __smolkvm_mailbox_create(struct smolkvm_vm *vm)
 {
-	__smolkvm_mailbox_priv.arg0 = 0;
-	__smolkvm_mailbox_priv.arg1 = 0;
 	__smolkvm_mailbox_priv.status = 0;
+	__smolkvm_mailbox_priv.inflight_command = 0;
+	__smolkvm_mailbox_priv.inflight_ptr = 0;
+	memset(__smolkvm_mailbox_priv.handlers, 0,
+		   sizeof(__smolkvm_mailbox_priv.handlers));
 
 	__smolkvm_plugin_mmio(vm, &__smolkvm_mailbox);
 
