@@ -55,15 +55,16 @@
  *   SMOLKVM_MMIOREGIONS_NUM      -- How many mmio, device, regions are possible, see default below.
  *   SMOLKVM_WANT_GDB_STUB        -- Include a GDB remote stub for debugging.
  *   SMOLKVM_WANT_GDB_STUB_DEBUG  -- Add noisy debug messages for the stub.
+ *   SMOLKVM_WANT_SIMPLE_DEVICES  -- Simple timer and interrupt controller.
  */
 #ifdef SMOLKVM_FOLD
 
 #ifndef SMOLKVM_MEMREGIONS_NUM
-#define SMOLKVM_MEMREGIONS_NUM	8
+#define SMOLKVM_MEMREGIONS_NUM		8
 #endif
 
 #ifndef SMOLKVM_MMIOREGIONS_NUM
-#define SMOLKVM_MMIOREGIONS_NUM	8
+#define SMOLKVM_MMIOREGIONS_NUM		8
 #endif
 
 #ifndef SMOLKVM_MAILBOX_HANDLERS_NUM
@@ -444,6 +445,8 @@ err_close_sock:
 #endif
 /* -- */
 
+/* GDB stuff 1 */
+#ifdef SMOLKVM_FOLD
 #ifdef SMOLKVM_WANT_GDB_STUB
 /* The raw "type" characters that are at the start of the GDB packet */
 #define SMOLKVM_GDB_STUB_PKTTYPE_EXTENDED	'!'
@@ -617,6 +620,7 @@ static inline int __smolkvm_gdb_stub_pkt_unpack(const unsigned char *raw,
 	return 0;
 }
 #endif /* SMOLKVM_WANT_GDB_STUB */
+#endif /* fold */
 
 /* mmio handling */
 #ifdef SMOLKVM_FOLD
@@ -1017,6 +1021,8 @@ int smolkvm_guest_write(struct smolkvm_vm *vm, uint64_t gpa, uint64_t len, const
 #endif
 /* -- */
 
+/* GDB stuff 2 */
+#ifdef SMOLKVM_FOLD
 #ifdef SMOLKVM_WANT_GDB_STUB
 static inline int __smolkvm_gdb_stub_start(struct smolkvm_vm *vm)
 {
@@ -1458,6 +1464,7 @@ static inline void __smolkvm_gdb_stub_stop(struct smolkvm_vm *vm)
 
 }
 #endif /* SMOLKVM_WANT_GDB_STUB */
+#endif /* fold */
 
 /* Early CPU init stuff, switch to longmode, initial guest page tables etc */
 #ifdef SMOLKVM_FOLD
@@ -1820,7 +1827,12 @@ int smolkvm_map_memory(struct smolkvm_vm *vm, uint64_t gpa, uint64_t size)
 /* Built-in commands */
 enum smolkvm_mailbox_command {
 	SMOLKVM_MAILBOX_CMD_NOP		= 0,
-	SMOLKVM_MAILBOX_CMD_MAP_MEMORY	= 1,	/* buffer: struct smolkvm_mailbox_map_memory */
+	SMOLKVM_MAILBOX_CMD_DIE		= 1,
+	SMOLKVM_MAILBOX_CMD_RESET	= 2,
+	/* buffer: struct smolkvm_mailbox_map_memory */
+	SMOLKVM_MAILBOX_CMD_MAP_MEMORY	= 3,
+
+	SMOLKVM_MAILBOX_CMD_MINUSER	= 16,
 };
 
 /* Command buffer for SMOLKVM_MAILBOX_CMD_MAP_MEMORY */
