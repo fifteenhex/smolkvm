@@ -56,7 +56,8 @@
  *   SMOLKVM_MMIOREGIONS_NUM      -- How many mmio, device, regions are possible, see default below.
  *   SMOLKVM_WANT_GDB_STUB        -- Include a GDB remote stub for debugging.
  *   SMOLKVM_WANT_GDB_STUB_DEBUG  -- Add noisy debug messages for the stub.
- *   SMOLKVM_WANT_SIMPLE_DEVICES  -- Simple timer and interrupt controller.
+ *   SMOLKVM_WANT_SIMPLE          -- Machine with the simple polled irqchip + timer (default).
+ *   SMOLKVM_WANT_APIC            -- Machine with the in-kernel APIC + PIT (boots stock OSes).
  */
 #ifdef SMOLKVM_FOLD
 
@@ -73,12 +74,21 @@
 #endif
 
 /*
- * The simple polled interrupt controller + timer MMIO devices, for bare-metal
- * guests. On by default; define SMOLKVM_NO_SIMPLE_DEVICES to leave them out
- * (e.g. when building the in-kernel APIC path that Linux needs).
+ * Machine type. Both machines have the console and mailbox; they differ only in
+ * the interrupt + timer hardware:
+ *
+ *   SMOLKVM_WANT_SIMPLE -- the simple polled MMIO irqchip + timer, for
+ *                          bare-metal guests (the default).
+ *   SMOLKVM_WANT_APIC   -- the in-kernel APIC/IOAPIC/PIC + 8254 PIT that a
+ *                          stock OS such as Linux expects.
+ *
+ * Define one; SIMPLE is assumed if neither is given.
  */
-#ifndef SMOLKVM_NO_SIMPLE_DEVICES
-#define SMOLKVM_WANT_SIMPLE_DEVICES
+#if defined(SMOLKVM_WANT_SIMPLE) && defined(SMOLKVM_WANT_APIC)
+#error "smolkvm: define only one of SMOLKVM_WANT_SIMPLE or SMOLKVM_WANT_APIC"
+#endif
+#if !defined(SMOLKVM_WANT_SIMPLE) && !defined(SMOLKVM_WANT_APIC)
+#define SMOLKVM_WANT_SIMPLE
 #endif
 /* -- */
 
@@ -110,6 +120,8 @@
 #define SMOLKVM_ERR_UNHANDLED_EXIT  113
 #define SMOLKVM_ERR_GET_CPUID       114
 #define SMOLKVM_ERR_SET_CPUID       115
+#define SMOLKVM_ERR_CREATE_IRQCHIP  116
+#define SMOLKVM_ERR_CREATE_PIT      117
 
 #endif
 /* -- */
@@ -2193,7 +2205,7 @@ static inline int __smolkvm_mailbox_create(struct smolkvm_vm *vm)
 
 /* Interrupt controller: a very basic 64-line IRQ status/mask/ack device */
 #ifdef SMOLKVM_FOLD
-#ifdef SMOLKVM_WANT_SIMPLE_DEVICES
+#ifdef SMOLKVM_WANT_SIMPLE
 
 /*
  * A minimal MMIO interrupt controller for up to 64 interrupt lines. It is a
@@ -2323,13 +2335,13 @@ static inline int __smolkvm_irqchip_create(struct smolkvm_vm *vm)
 	return __smolkvm_plugin_mmio(vm, &__smolkvm_irqchip);
 }
 
-#endif /* SMOLKVM_WANT_SIMPLE_DEVICES */
+#endif /* SMOLKVM_WANT_SIMPLE */
 #endif
 /* -- */
 
 /* Timer: free-running counter + programmable one-shot */
 #ifdef SMOLKVM_FOLD
-#ifdef SMOLKVM_WANT_SIMPLE_DEVICES
+#ifdef SMOLKVM_WANT_SIMPLE
 
 /*
  * One MMIO device providing two things:
@@ -2533,7 +2545,7 @@ static inline int __smolkvm_timer_create(struct smolkvm_vm *vm)
 	return __smolkvm_plugin_mmio(vm, &__smolkvm_timer);
 }
 
-#endif /* SMOLKVM_WANT_SIMPLE_DEVICES */
+#endif /* SMOLKVM_WANT_SIMPLE */
 #endif
 /* -- */
 
@@ -2686,6 +2698,35 @@ static int __smolkvm_setup_cpuid(struct smolkvm_vm *vm)
 	return 0;
 }
 
+#ifdef SMOLKVM_WANT_APIC
+/*
+ * Create the in-kernel interrupt controller (PIC + IOAPIC + per-vCPU LAPIC)
+ * and the 8254 PIT that a stock OS expects. Must run after KVM_CREATE_VM but
+ * before KVM_CREATE_VCPU, so the vCPU comes up with an in-kernel local APIC.
+ * With this in place a guest HLT halts in-kernel and wakes on an interrupt
+ * rather than exiting to us.
+ */
+static int __smolkvm_create_kernel_irqchip(int vm_fd)
+{
+	struct kvm_pit_config pit = { 0 };
+	int ret;
+
+	ret = ioctl(vm_fd, KVM_CREATE_IRQCHIP, 0);
+	if (ret < 0) {
+		__smolkvm_debug("KVM_CREATE_IRQCHIP failed: %d\n", ret);
+		return -SMOLKVM_ERR_CREATE_IRQCHIP;
+	}
+
+	ret = ioctl(vm_fd, KVM_CREATE_PIT2, &pit);
+	if (ret < 0) {
+		__smolkvm_debug("KVM_CREATE_PIT2 failed: %d\n", ret);
+		return -SMOLKVM_ERR_CREATE_PIT;
+	}
+
+	return 0;
+}
+#endif
+
 int smolkvm_create_vm(struct smolkvm_vm *vm)
 {
 	struct kvm_userspace_memory_region *memory_region = &vm->memregions[0];
@@ -2702,6 +2743,13 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 	vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0);
 	if (vm_fd < 0)
 		return -SMOLKVM_ERR_CREATEVM;
+
+#ifdef SMOLKVM_WANT_APIC
+	/* Must precede KVM_CREATE_VCPU so the vCPU gets an in-kernel LAPIC */
+	ret = __smolkvm_create_kernel_irqchip(vm_fd);
+	if (ret)
+		return ret;
+#endif
 
 	vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0);
 	if (vcpu_fd < 0)
@@ -2776,7 +2824,7 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 	/* Plug in the mailbox so the guest can ask us to do things */
 	__smolkvm_mailbox_create(vm);
 
-#ifdef SMOLKVM_WANT_SIMPLE_DEVICES
+#ifdef SMOLKVM_WANT_SIMPLE
 	/* Plug in the interrupt controller */
 	__smolkvm_irqchip_create(vm);
 
