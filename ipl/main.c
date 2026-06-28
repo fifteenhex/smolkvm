@@ -2,6 +2,7 @@
 #include <asm/bootparam.h>
 
 #include "params.h"
+#include "machine.h"
 #include "mailbox.h"
 #include "loadkernel.h"
 
@@ -25,6 +26,25 @@ static struct XSDP rsdp = {
 };
 
 static struct boot_params linux_boot_params = { 0 };
+
+#define PTE_PRESENT	(1ull << 0)
+#define PTE_RW		(1ull << 1)
+#define PTE_PS		(1ull << 7)	/* 2MB huge page */
+#define HUGE_PAGE_SZ	0x200000ull
+
+static void map_system_ram(uint64_t base, uint64_t size)
+{
+	uint64_t *pd = (uint64_t *) SMOLKVM_PAGETABLE_PD;
+	uint64_t gpa;
+
+	for (gpa = base; gpa < base + size; gpa += HUGE_PAGE_SZ)
+		pd[gpa / HUGE_PAGE_SZ] = gpa | PTE_PS | PTE_RW | PTE_PRESENT;
+
+	__asm__ __volatile__(
+		"mov %%cr3, %%rax\n\t"
+		"mov %%rax, %%cr3"
+		::: "rax", "memory");
+}
 
 static void fill_boot_params(void)
 {
@@ -65,6 +85,9 @@ void _c_start(void)
 	sysramcmd.gpa = ipl_params.ram_base;
 	sysramcmd.size = ipl_params.ram_sz;
 	mailbox_post(SMOLKVM_MAILBOX_CMD_MAP_MEMORY, &sysramcmd);
+
+	printf("Mapping system RAM into page tables\n");
+	map_system_ram(ipl_params.ram_base, ipl_params.ram_sz);
 
 	printf("Asking for kernel load\n");
 
