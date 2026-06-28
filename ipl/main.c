@@ -25,6 +25,109 @@ struct XSDP {
 static struct XSDP rsdp = {
 };
 
+/* --- ACPI tables --------------------------------------------------------- */
+
+/* Common header on every ACPI system description table (the "SDT" header) */
+struct acpi_sdt_header {
+	char signature[4];
+	uint32_t length;
+	uint8_t revision;
+	uint8_t checksum;
+	char oem_id[6];
+	char oem_table_id[8];
+	uint32_t oem_revision;
+	uint32_t creator_id;
+	uint32_t creator_revision;
+} __attribute__ ((packed));
+
+/* MADT entry types we emit */
+struct acpi_madt_local_apic {
+	uint8_t type;			/* 0 */
+	uint8_t length;			/* 8 */
+	uint8_t acpi_processor_id;
+	uint8_t apic_id;
+	uint32_t flags;			/* bit 0 = enabled */
+} __attribute__ ((packed));
+
+struct acpi_madt_io_apic {
+	uint8_t type;			/* 1 */
+	uint8_t length;			/* 12 */
+	uint8_t io_apic_id;
+	uint8_t reserved;
+	uint32_t io_apic_address;
+	uint32_t gsi_base;
+} __attribute__ ((packed));
+
+struct acpi_madt_interrupt_override {
+	uint8_t type;			/* 2 */
+	uint8_t length;			/* 10 */
+	uint8_t bus;			/* 0 = ISA */
+	uint8_t source;			/* source IRQ */
+	uint32_t gsi;			/* global system interrupt it maps to */
+	uint16_t flags;			/* polarity / trigger (0 = bus default) */
+} __attribute__ ((packed));
+
+struct ipl_madt {
+	struct acpi_sdt_header header;
+	uint32_t local_apic_address;
+	uint32_t flags;			/* bit 0 = PCAT_COMPAT (8259 present) */
+	struct acpi_madt_local_apic lapic;
+	struct acpi_madt_io_apic ioapic;
+	struct acpi_madt_interrupt_override pit_override;
+} __attribute__ ((packed));
+
+static struct ipl_madt madt = {
+	.header = {
+		.signature = "APIC",
+		.length = sizeof(struct ipl_madt),
+		.revision = 4,
+		.oem_id = "SMOLKV",
+		.oem_table_id = "SMOLMADT",
+		.oem_revision = 1,
+		.creator_revision = 1,
+	},
+	.local_apic_address = (uint32_t) SMOLKVM_APIC_LAPIC_BASE,
+	.flags = 1,	/* PCAT_COMPAT: KVM's 8259 PICs are present */
+	.lapic = {
+		.type = 0, .length = 8,
+		.acpi_processor_id = 0, .apic_id = 0,
+		.flags = 1,	/* enabled */
+	},
+	.ioapic = {
+		.type = 1, .length = 12,
+		.io_apic_id = 0,
+		.io_apic_address = (uint32_t) SMOLKVM_APIC_IOAPIC_BASE,
+		.gsi_base = SMOLKVM_APIC_IOAPIC_GSI_BASE,
+	},
+	/* Standard PC wiring: the PIT (ISA IRQ0) lands on IOAPIC pin 2 */
+	.pit_override = {
+		.type = 2, .length = 10,
+		.bus = 0, .source = 0, .gsi = 2, .flags = 0,
+	},
+};
+
+static void acpi_set_checksum(struct acpi_sdt_header *h)
+{
+	uint8_t *p = (uint8_t *) h;
+	uint8_t sum = 0;
+	uint32_t i;
+
+	h->checksum = 0;
+	for (i = 0; i < h->length; i++)
+		sum += p[i];
+
+	h->checksum = (uint8_t) (0 - sum);
+}
+
+static uint64_t build_madt(void)
+{
+	acpi_set_checksum(&madt.header);
+
+	return (uint64_t) (uintptr_t) &madt;
+}
+
+/* --- boot ---------------------------------------------------------------- */
+
 static struct boot_params linux_boot_params = { 0 };
 
 /* TODO: set console=/earlyprintk= to match your custom tty to see boot output */
@@ -126,6 +229,9 @@ void _c_start(void)
 	printf("Asking for kernel load\n");
 
 	mailbox_post(SMOLKVM_MAILBOX_CMD_LOADKERNEL, &loadkernel);
+
+	printf("Building ACPI tables\n");
+	build_madt();
 
 	printf("Filling boot params\n");
 	fill_boot_params();
