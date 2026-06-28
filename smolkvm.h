@@ -20,6 +20,7 @@
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
@@ -2565,39 +2566,56 @@ int smolkvm_load_elf(struct smolkvm_vm *vm, const void *elf_image)
 	return smolkvm_load_elf_with_displacement(vm, elf_image, 0);
 }
 
-int smolkvm_load_elf_file(struct smolkvm_vm *vm, const char *elf_path)
+int smolkvm_load_elf_file_with_displacement(struct smolkvm_vm *vm, const char *elf_path, int64_t displacement)
 {
+	struct stat st;
 	void *elf_image;
+	ssize_t got;
 	int ret;
 	int elf;
 
 	elf = open(elf_path, O_RDONLY);
 	if (elf < 0) {
-		printf("Failed to open IPL ELF: %d\n", elf);
+		printf("Failed to open ELF: %d\n", elf);
 		return -1;
 	}
 
-	elf_image = malloc(SMOLKVM_BASEMEMORY_SZ);
+	if (fstat(elf, &st) < 0 || st.st_size <= 0) {
+		printf("Failed to stat ELF\n");
+		close(elf);
+		return -1;
+	}
+
+	elf_image = malloc((size_t) st.st_size);
 	if (!elf_image) {
 		printf("Failed to malloc() memory for IPL ELF image\n");
+		close(elf);
 		return -1;
 	}
 
-	ret = read(elf, elf_image, SMOLKVM_BASEMEMORY_SZ);
-	if (ret <= 0) {
-		printf("Failed to read ELF image: %d\n", ret);
+	got = read(elf, elf_image, (size_t) st.st_size);
+	close(elf);
+
+	if (got != st.st_size) {
+		printf("Failed to read ELF image: %zd\n", got);
+		free(elf_image);
 		return -1;
 	}
 
-	printf("Read %d bytes of ELF image\n", ret);
+	printf("Read %zd bytes of ELF image\n", got);
 
 	ret = smolkvm_load_elf(vm, elf_image);
+	free(elf_image);
 	if (ret)
 		return -1;
 
 	return 0;
 }
 
+int smolkvm_load_elf_file(struct smolkvm_vm *vm, const char *elf_path)
+{
+	return smolkvm_load_elf_file_with_displacement(vm, elf_path, 0);
+}
 #endif
 /* -- */
 

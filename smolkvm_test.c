@@ -19,7 +19,15 @@ static uint64_t get_params_fn(struct smolkvm_vm *vm, uint64_t command, void *buf
 
 static uint64_t load_kernel_fn(struct smolkvm_vm *vm, uint64_t command, void *buffer, void *priv)
 {
+	const char *kernel_path = priv;
+
 	printf("Guest asked for kernel to be loaded\n");
+
+	if (!kernel_path)
+		printf("No kernel path set!\n");
+
+	smolkvm_load_elf_file(vm, kernel_path);
+
 	return 0;
 }
 
@@ -79,7 +87,7 @@ int main(int argc, char **argv, char **envp)
 		return 1;
 
 	ret = smolkvm_mailbox_register(&vm, MAILBOX_CMD_LOADKERNEL, &loadkernelparams,
-				       sizeof(loadkernelparams), load_kernel_fn, NULL);
+				       sizeof(loadkernelparams), load_kernel_fn, kernel_path);
 	if (ret)
 		return 1;
 

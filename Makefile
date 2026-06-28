@@ -1,6 +1,8 @@
 all: smolkvm_test_gdb_libc \
 	smolkvm_test_debug_libc \
-	smolkvm_test_debug_gdb_libc
+	smolkvm_test_debug_gdb_libc \
+	smolkvm_test_libc \
+	$(IPL)
 
 #	-Wall \
 #	-flto \
@@ -19,7 +21,7 @@ $(IPL): ipl/include/machine.h
 	$(MAKE) -C ipl/
 
 ifdef NOLIBCDIR
-all: smolkvm_test smolkvm_test_gdb $(IPL)
+all: smolkvm_test smolkvm_test_gdb
 
 smolkvm_test: smolkvm_test.c smolkvm.h $(IPL)
 	$(CC) -nostdlib -include $(NOLIBCDIR)/nolibc.h $(COPTS) -static -o $@ $< -lgcc
