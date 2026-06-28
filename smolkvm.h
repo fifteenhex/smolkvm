@@ -1832,6 +1832,13 @@ void smolkvm_dump_register_header(const struct smolkvm_vm *vm, FILE *out)
 		fprintf(out, "\n");
 	}
 
+	fprintf(out, "/* base (IPL) region: identity-mapped guest RAM holding the IPL + page tables */\n");
+	fprintf(out, "#define %-40s 0x%016llxULL\n", "SMOLKVM_BASEMEMORY_BASE",
+		(unsigned long long) SMOLKVM_BASEMEMORY_PHYS_START);
+	fprintf(out, "#define %-40s 0x%016llxULL\n", "SMOLKVM_BASEMEMORY_LEN",
+		(unsigned long long) SMOLKVM_BASEMEMORY_SZ);
+	fprintf(out, "\n");
+
 	fprintf(out, "/* guest page tables: identity map, 2MB huge pages, PD spans the first 1GB; CR3 = PML4 */\n");
 	fprintf(out, "#define %-40s 0x%016llxULL\n", "SMOLKVM_PAGETABLE_PML4",
 		(unsigned long long) SMOLKVM_PAGETABLE_PHYS);

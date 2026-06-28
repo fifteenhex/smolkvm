@@ -27,6 +27,9 @@ static struct XSDP rsdp = {
 
 static struct boot_params linux_boot_params = { 0 };
 
+/* TODO: set console=/earlyprintk= to match your custom tty to see boot output */
+static char cmdline[] = "";
+
 #define PTE_PRESENT	(1ull << 0)
 #define PTE_RW		(1ull << 1)
 #define PTE_PS		(1ull << 7)	/* 2MB huge page */
@@ -46,9 +49,40 @@ static void map_system_ram(uint64_t base, uint64_t size)
 		::: "rax", "memory");
 }
 
+#ifndef E820_TYPE_RAM
+#define E820_TYPE_RAM		1
+#endif
+#ifndef E820_TYPE_RESERVED
+#define E820_TYPE_RESERVED	2
+#endif
+
+static void e820_add(struct boot_params *bp, uint64_t addr, uint64_t size, uint32_t type)
+{
+	struct boot_e820_entry *e = &bp->e820_table[bp->e820_entries++];
+
+	e->addr = addr;
+	e->size = size;
+	e->type = type;
+}
+
 static void fill_boot_params(void)
 {
+	struct boot_params *bp = &linux_boot_params;
 
+	/* Off-limits to the kernel: the MMIO devices and the IPL's own region */
+	e820_add(bp, SMOLKVM_CONSOLE_BASE,    SMOLKVM_CONSOLE_LEN,    E820_TYPE_RESERVED);
+	e820_add(bp, SMOLKVM_MAILBOX_BASE,    SMOLKVM_MAILBOX_LEN,    E820_TYPE_RESERVED);
+	e820_add(bp, SMOLKVM_BASEMEMORY_BASE, SMOLKVM_BASEMEMORY_LEN, E820_TYPE_RESERVED);
+
+	/* The system RAM we mapped is usable */
+	e820_add(bp, ipl_params.ram_base, ipl_params.ram_sz, E820_TYPE_RAM);
+
+	bp->hdr.type_of_loader = 0xFF;
+	bp->hdr.boot_flag      = 0xAA55;
+	bp->hdr.header         = 0x53726448;	/* "HdrS" */
+	bp->hdr.version        = 0x020d;
+	bp->hdr.cmd_line_ptr   = (uint32_t) (uintptr_t) cmdline;
+	bp->hdr.cmdline_size   = sizeof(cmdline);
 }
 
 __attribute__((noreturn))
@@ -92,6 +126,9 @@ void _c_start(void)
 	printf("Asking for kernel load\n");
 
 	mailbox_post(SMOLKVM_MAILBOX_CMD_LOADKERNEL, &loadkernel);
+
+	printf("Filling boot params\n");
+	fill_boot_params();
 
 	printf("Jumping to entry @ %p\n", (void *) kernel_entry);
 
