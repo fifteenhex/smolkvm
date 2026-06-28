@@ -92,6 +92,18 @@
 #endif
 /* -- */
 
+/*
+ * Fixed locations of KVM's in-kernel controllers, so the IPL can build a MADT
+ * that matches what KVM_CREATE_IRQCHIP actually emulates. These are the x86
+ * architectural defaults.
+ */
+#ifdef SMOLKVM_WANT_APIC
+#define SMOLKVM_APIC_LAPIC_BASE		0xFEE00000ULL
+#define SMOLKVM_APIC_IOAPIC_BASE	0xFEC00000ULL
+#define SMOLKVM_APIC_IOAPIC_GSI_BASE	0
+#endif
+/* -- */
+
 /* Utility macros */
 #define SMOLKVM_ARRAYSIZE(_a)	(sizeof(_a)/sizeof(_a[0]))
 #define SMOLKVM_BIT(_bit)	(1ULL << _bit)
@@ -1817,6 +1829,17 @@ void smolkvm_dump_register_header(const struct smolkvm_vm *vm, FILE *out)
 
 		fprintf(out, "\n");
 	}
+
+#ifdef SMOLKVM_WANT_APIC
+	fprintf(out, "/* in-kernel APIC + IOAPIC (emulated by KVM, for the MADT) */\n");
+	fprintf(out, "#define %-40s 0x%016llxULL\n", "SMOLKVM_APIC_LAPIC_BASE",
+		(unsigned long long) SMOLKVM_APIC_LAPIC_BASE);
+	fprintf(out, "#define %-40s 0x%016llxULL\n", "SMOLKVM_APIC_IOAPIC_BASE",
+		(unsigned long long) SMOLKVM_APIC_IOAPIC_BASE);
+	fprintf(out, "#define %-40s %d\n", "SMOLKVM_APIC_IOAPIC_GSI_BASE",
+		SMOLKVM_APIC_IOAPIC_GSI_BASE);
+	fprintf(out, "\n");
+#endif
 
 	fprintf(out, "#endif /* SMOLKVM_REGISTERS_H */\n");
 }

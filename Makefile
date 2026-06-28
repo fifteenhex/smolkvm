@@ -33,19 +33,20 @@ else
 $(warning Please pass NOLIBCDIR with the path to your copy of nolibc (tools/include/nolibc/ in the linux source) for static targets)
 endif
 
+MACHINETYPE=-DSMOLKVM_WANT_APIC
 
 smolkvm_test_libc: smolkvm_test.c smolkvm.h
-	$(CC) $(COPTS) -o $@ $<
+	$(CC) $(COPTS) $(MACHINETYPE) -o $@ $<
 
 smolkvm_test_debug_libc: smolkvm_test.c smolkvm.h
-	$(CC) $(COPTS) -DSMOLKVM_DEBUG -o $@ $<
+	$(CC) $(COPTS) $(MACHINETYPE) -DSMOLKVM_DEBUG -o $@ $<
 
 smolkvm_test_gdb_libc: smolkvm_test.c smolkvm.h
-	$(CC) -DSMOLKVM_WANT_GDB_STUB -DSMOLKVM_WANT_GDB_STUB_DEBUG $(COPTS) -o $@ $<
+	$(CC) -DSMOLKVM_WANT_GDB_STUB -DSMOLKVM_WANT_GDB_STUB_DEBUG $(COPTS) $(MACHINETYPE) -o $@ $<
 
 
 smolkvm_test_debug_gdb_libc: smolkvm_test.c smolkvm.h
-	$(CC) -DSMOLKVM_DEBUG -DSMOLKVM_WANT_GDB_STUB -DSMOLKVM_WANT_GDB_STUB_DEBUG $(COPTS) -o $@ $<
+	$(CC) -DSMOLKVM_DEBUG -DSMOLKVM_WANT_GDB_STUB -DSMOLKVM_WANT_GDB_STUB_DEBUG $(COPTS) $(MACHINETYPE) -o $@ $<
 
 .PHONY: clean
 clean:
