@@ -20,5 +20,9 @@ void _c_start(void)
 
 	mailbox_post(SMOLKVM_MAILBOX_CMD_MAP_MEMORY, &sysramcmd);
 
+	printf("Asking for kernel load\n");
+
+	mailbox_post(SMOLKVM_MAILBOX_CMD_LOADKERNEL, &sysramcmd);
+
 	while(1) { };
 }

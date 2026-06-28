@@ -188,10 +188,19 @@ struct smolkvm_pgtable {
 
 struct smolkvm_vm;
 
+struct smolkvm_mmio_reg {
+	const char *name;
+	uint64_t offset;
+	uint64_t size;
+};
+
 struct smolkvm_mmio {
 	const char *name;
 	uint64_t phys;
 	uint64_t len;
+
+	const struct smolkvm_mmio_reg *regs;
+	size_t num_regs;
 
 	void (*pre_run)(struct smolkvm_vm *vm,
 			struct smolkvm_mmio *mmio);
@@ -2409,7 +2418,7 @@ static inline int __smolkvm_timer_create(struct smolkvm_vm *vm)
 /* ELF loading */
 #ifdef SMOLKVM_FOLD
 
-int smolkvm_load_elf(struct smolkvm_vm *vm, const void *elf_image)
+int smolkvm_load_elf_with_displacement(struct smolkvm_vm *vm, const void *elf_image, int64_t displacement)
 {
 	Elf64_Ehdr *ehdr = (Elf64_Ehdr *) elf_image;
 	Elf64_Phdr *phdrs;
@@ -2445,6 +2454,11 @@ int smolkvm_load_elf(struct smolkvm_vm *vm, const void *elf_image)
 	}
 
 	return 0;
+}
+
+int smolkvm_load_elf(struct smolkvm_vm *vm, const void *elf_image)
+{
+	return smolkvm_load_elf_with_displacement(vm, elf_image, 0);
 }
 
 int smolkvm_load_elf_file(struct smolkvm_vm *vm, const char *elf_path)
