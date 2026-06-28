@@ -65,6 +65,15 @@
 #ifndef SMOLKVM_MMIOREGIONS_NUM
 #define SMOLKVM_MMIOREGIONS_NUM	8
 #endif
+
+/*
+ * The simple polled interrupt controller + timer MMIO devices, for bare-metal
+ * guests. On by default; define SMOLKVM_NO_SIMPLE_DEVICES to leave them out
+ * (e.g. when building the in-kernel APIC path that Linux needs).
+ */
+#ifndef SMOLKVM_NO_SIMPLE_DEVICES
+#define SMOLKVM_WANT_SIMPLE_DEVICES
+#endif
 /* -- */
 
 /* Utility macros */
@@ -1869,6 +1878,7 @@ static inline int __smolkvm_mailbox_create(struct smolkvm_vm *vm)
 
 /* Interrupt controller: a very basic 64-line IRQ status/mask/ack device */
 #ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_SIMPLE_DEVICES
 
 /*
  * A minimal MMIO interrupt controller for up to 64 interrupt lines. It is a
@@ -1990,11 +2000,13 @@ static inline int __smolkvm_irqchip_create(struct smolkvm_vm *vm)
 	return __smolkvm_plugin_mmio(vm, &__smolkvm_irqchip);
 }
 
+#endif /* SMOLKVM_WANT_SIMPLE_DEVICES */
 #endif
 /* -- */
 
 /* Timer: free-running counter + programmable one-shot */
 #ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_SIMPLE_DEVICES
 
 /*
  * One MMIO device providing two things:
@@ -2188,6 +2200,7 @@ static inline int __smolkvm_timer_create(struct smolkvm_vm *vm)
 	return __smolkvm_plugin_mmio(vm, &__smolkvm_timer);
 }
 
+#endif /* SMOLKVM_WANT_SIMPLE_DEVICES */
 #endif
 /* -- */
 
@@ -2356,11 +2369,13 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 	/* Plug in the mailbox so the guest can ask us to do things */
 	__smolkvm_mailbox_create(vm);
 
+#ifdef SMOLKVM_WANT_SIMPLE_DEVICES
 	/* Plug in the interrupt controller */
 	__smolkvm_irqchip_create(vm);
 
 	/* Plug in the timer */
 	__smolkvm_timer_create(vm);
+#endif
 
 	return 0;
 }
