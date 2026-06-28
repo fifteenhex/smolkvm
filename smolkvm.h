@@ -892,10 +892,17 @@ static void __smolkvm_console_post_run(struct smolkvm_vm *vm,
 
 #define SMOLKVM_CONSOLE_PHYS 0x1000
 
+static const struct smolkvm_mmio_reg __smolkvm_console_regs[] = {
+	{ .name = "TXRX",   .offset = __SMOLKVM_CONSOLE_REG_TXRX,   .size = 1 },
+	{ .name = "STATUS", .offset = __SMOLKVM_CONSOLE_REG_STATUS, .size = 1 },
+};
+
 static struct smolkvm_mmio __smolkvm_console = {
 	.name = "console",
 	.phys = SMOLKVM_CONSOLE_PHYS,
 	.len = 8,
+	.regs = __smolkvm_console_regs,
+	.num_regs = SMOLKVM_ARRAYSIZE(__smolkvm_console_regs),
 	.pre_run = __smolkvm_console_pre_run,
 	.write = __smolkvm_console_write,
 	.read = __smolkvm_console_read,
@@ -1989,10 +1996,17 @@ static uint64_t __smolkvm_mailbox_read(struct smolkvm_vm *vm,
 	return 0;
 }
 
+static const struct smolkvm_mmio_reg __smolkvm_mailbox_regs[] = {
+	{ .name = "SUBMIT", .offset = __SMOLKVM_MAILBOX_REG_SUBMIT, .size = 8 },
+	{ .name = "STATUS", .offset = __SMOLKVM_MAILBOX_REG_STATUS, .size = 8 },
+};
+
 static struct smolkvm_mmio __smolkvm_mailbox = {
 	.name = "mailbox",
 	.phys = SMOLKVM_MAILBOX_PHYS,
 	.len = SMOLKVM_MAILBOX_LEN,
+	.regs = __smolkvm_mailbox_regs,
+	.num_regs = SMOLKVM_ARRAYSIZE(__smolkvm_mailbox_regs),
 	.write = __smolkvm_mailbox_write,
 	.read = __smolkvm_mailbox_read,
 	.priv = &__smolkvm_mailbox_priv,
@@ -2161,10 +2175,18 @@ static void __smolkvm_irqchip_write(struct smolkvm_vm *vm,
 	}
 }
 
+static const struct smolkvm_mmio_reg __smolkvm_irqchip_regs[] = {
+	{ .name = "STATUS", .offset = __SMOLKVM_IRQCHIP_REG_STATUS, .size = 8 },
+	{ .name = "MASK",   .offset = __SMOLKVM_IRQCHIP_REG_MASK,   .size = 8 },
+	{ .name = "ACK",    .offset = __SMOLKVM_IRQCHIP_REG_ACK,    .size = 8 },
+};
+
 static struct smolkvm_mmio __smolkvm_irqchip = {
 	.name = "irqchip",
 	.phys = SMOLKVM_IRQCHIP_PHYS,
 	.len = SMOLKVM_IRQCHIP_LEN,
+	.regs = __smolkvm_irqchip_regs,
+	.num_regs = SMOLKVM_ARRAYSIZE(__smolkvm_irqchip_regs),
 	.write = __smolkvm_irqchip_write,
 	.read = __smolkvm_irqchip_read,
 	.priv = &__smolkvm_irqchip_priv,
@@ -2388,10 +2410,20 @@ static void __smolkvm_timer_tick(struct smolkvm_vm *vm, struct smolkvm_mmio *mmi
 	__smolkvm_timer_update(vm, mmio->priv);
 }
 
+static const struct smolkvm_mmio_reg __smolkvm_timer_regs[] = {
+	{ .name = "FREQ",    .offset = __SMOLKVM_TIMER_REG_FREQ,    .size = 8 },
+	{ .name = "COUNTER", .offset = __SMOLKVM_TIMER_REG_COUNTER, .size = 8 },
+	{ .name = "ONESHOT", .offset = __SMOLKVM_TIMER_REG_ONESHOT, .size = 8 },
+	{ .name = "STATUS",  .offset = __SMOLKVM_TIMER_REG_STATUS,  .size = 8 },
+	{ .name = "IRQ",     .offset = __SMOLKVM_TIMER_REG_IRQ,     .size = 8 },
+};
+
 static struct smolkvm_mmio __smolkvm_timer = {
 	.name = "timer",
 	.phys = SMOLKVM_TIMER_PHYS,
 	.len = SMOLKVM_TIMER_LEN,
+	.regs = __smolkvm_timer_regs,
+	.num_regs = SMOLKVM_ARRAYSIZE(__smolkvm_timer_regs),
 	.pre_run = __smolkvm_timer_tick,
 	.post_run = __smolkvm_timer_tick,
 	.write = __smolkvm_timer_write,
