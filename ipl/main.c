@@ -2,6 +2,7 @@
 
 #include "params.h"
 #include "mailbox.h"
+#include "loadkernel.h"
 
 static struct ipl_params ipl_params = { 0 };
 
@@ -10,6 +11,10 @@ void _c_start(void)
 	struct smolkvm_mailbox_map_memory sysramcmd = {
 		.gpa = 0x400000,
 		.size = 0x4000000,
+	};
+	uint64_t kernel_entry;
+	struct cmd_buf_loadkernel loadkernel = {
+		.entry_ptr = (uint64_t) &kernel_entry,
 	};
 
 	printf("smolkvm test vm IPL\n");
@@ -22,7 +27,9 @@ void _c_start(void)
 
 	printf("Asking for kernel load\n");
 
-	mailbox_post(SMOLKVM_MAILBOX_CMD_LOADKERNEL, &sysramcmd);
+	mailbox_post(SMOLKVM_MAILBOX_CMD_LOADKERNEL, &loadkernel);
+
+	printf("Jumping to entry @ %p\n", (void *) kernel_entry);
 
 	while(1) { };
 }

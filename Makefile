@@ -14,7 +14,7 @@ COPTS= -ggdb \
 IPL=ipl/build/ipl
 
 ipl/include/machine.h: smolkvm_test_libc
-	smolkvm_test_libc -h $@
+	./smolkvm_test_libc -h $@
 
 .PHONY: $(IPL)
 $(IPL): ipl/include/machine.h

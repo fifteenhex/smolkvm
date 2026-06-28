@@ -1019,12 +1019,27 @@ static inline int __smolkvm_memory_write(const struct smolkvm_vm *vm, uint64_t a
 	return 0;
 }
 
-/*
- * Public guest-memory helpers for host code (e.g. mailbox handlers placing a
- * response at a guest pointer carried in the command buffer). `gpa` is a
- * guest-physical address; both return 0 on success, -1 if the range isn't
- * inside a mapped region.
- */
+static inline int __smolkvm_memory_set(const struct smolkvm_vm *vm, uint64_t addr, uint64_t len, int byte)
+{
+	const struct kvm_userspace_memory_region *memory_region;
+	int region;
+	int ret;
+
+	region = __smolkvm_find_memregion(vm, addr);
+	if (region < 0)
+		return -1;
+
+	memory_region = &vm->memregions[region];
+
+	ret = __smolkvm_memory_check_bounds(addr, len, memory_region);
+	if (ret)
+		return ret;
+
+	memset(SMOLKVM_MEMREGION_PTR(memory_region, addr), byte, len);
+
+	return 0;
+}
+
 int smolkvm_guest_read(struct smolkvm_vm *vm, uint64_t gpa, uint64_t len, void *dst)
 {
 	return __smolkvm_memory_read(vm, gpa, len, dst);
@@ -2523,7 +2538,7 @@ static inline int __smolkvm_timer_create(struct smolkvm_vm *vm)
 /* ELF loading */
 #ifdef SMOLKVM_FOLD
 
-int smolkvm_load_elf_with_displacement(struct smolkvm_vm *vm, const void *elf_image, int64_t displacement)
+int smolkvm_load_elf_with_displacement(struct smolkvm_vm *vm, const void *elf_image, int64_t displacement, uint64_t *entry)
 {
 	Elf64_Ehdr *ehdr = (Elf64_Ehdr *) elf_image;
 	Elf64_Phdr *phdrs;
@@ -2555,18 +2570,27 @@ int smolkvm_load_elf_with_displacement(struct smolkvm_vm *vm, const void *elf_im
 		if (phdr->p_type == PT_LOAD) {
 			const void *src = elf_image + phdr->p_offset;
 			__smolkvm_memory_write(vm, phdr->p_paddr, phdr->p_filesz, src);
+
+			/* Zero the tail of segments whose memory image is larger
+			 * than their file image (e.g. .bss). */
+			if (phdr->p_memsz > phdr->p_filesz)
+				__smolkvm_memory_set(vm, phdr->p_paddr + phdr->p_filesz,
+						     phdr->p_memsz - phdr->p_filesz, 0);
 		}
 	}
+
+	if (entry)
+		*entry = ehdr->e_entry;
 
 	return 0;
 }
 
-int smolkvm_load_elf(struct smolkvm_vm *vm, const void *elf_image)
+int smolkvm_load_elf(struct smolkvm_vm *vm, const void *elf_image, uint64_t *entry)
 {
-	return smolkvm_load_elf_with_displacement(vm, elf_image, 0);
+	return smolkvm_load_elf_with_displacement(vm, elf_image, 0, entry);
 }
 
-int smolkvm_load_elf_file_with_displacement(struct smolkvm_vm *vm, const char *elf_path, int64_t displacement)
+int smolkvm_load_elf_file_with_displacement(struct smolkvm_vm *vm, const char *elf_path, int64_t displacement, uint64_t *entry)
 {
 	struct stat st;
 	void *elf_image;
@@ -2604,7 +2628,7 @@ int smolkvm_load_elf_file_with_displacement(struct smolkvm_vm *vm, const char *e
 
 	printf("Read %zd bytes of ELF image\n", got);
 
-	ret = smolkvm_load_elf(vm, elf_image);
+	ret = smolkvm_load_elf_with_displacement(vm, elf_image, displacement, entry);
 	free(elf_image);
 	if (ret)
 		return -1;
@@ -2612,9 +2636,9 @@ int smolkvm_load_elf_file_with_displacement(struct smolkvm_vm *vm, const char *e
 	return 0;
 }
 
-int smolkvm_load_elf_file(struct smolkvm_vm *vm, const char *elf_path)
+int smolkvm_load_elf_file(struct smolkvm_vm *vm, const char *elf_path, uint64_t *entry)
 {
-	return smolkvm_load_elf_file_with_displacement(vm, elf_path, 0);
+	return smolkvm_load_elf_file_with_displacement(vm, elf_path, 0, entry);
 }
 #endif
 /* -- */
