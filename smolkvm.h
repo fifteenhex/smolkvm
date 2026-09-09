@@ -54,6 +54,7 @@
  *   SMOLKVM_DEBUG                -- Be very noisy about what is going on to help with working out what is broken.
  *   SMOLKVM_MEMREGIONS_NUM       -- How many memory regions are possible, see default below.
  *   SMOLKVM_MMIOREGIONS_NUM      -- How many mmio, device, regions are possible, see default below.
+ *   SMOLKVM_WANT_SIMPLE          -- Machine with the simple polled irqchip + timer (default).
  */
 #ifdef SMOLKVM_FOLD
 
@@ -68,6 +69,25 @@
 #ifndef SMOLKVM_MAILBOX_HANDLERS_NUM
 #define SMOLKVM_MAILBOX_HANDLERS_NUM	16
 #endif
+
+/*
+ * Machine type. Both machines have the console and mailbox; they differ only in
+ * the interrupt + timer hardware:
+ *
+ *   SMOLKVM_WANT_SIMPLE -- the simple polled MMIO irqchip + timer, for
+ *                          bare-metal guests (the default).
+ *   SMOLKVM_WANT_APIC   -- the in-kernel APIC/IOAPIC/PIC + 8254 PIT that a
+ *                          stock OS such as Linux expects.
+ *
+ * Define one; SIMPLE is assumed if neither is given.
+ */
+#if defined(SMOLKVM_WANT_SIMPLE) && defined(SMOLKVM_WANT_APIC)
+#error "smolkvm: define only one of SMOLKVM_WANT_SIMPLE or SMOLKVM_WANT_APIC"
+#endif
+#if !defined(SMOLKVM_WANT_SIMPLE) && !defined(SMOLKVM_WANT_APIC)
+#define SMOLKVM_WANT_SIMPLE
+#endif
+/* -- */
 
 /* Utility macros */
 #define SMOLKVM_ARRAYSIZE(_a)	(sizeof(_a)/sizeof(_a[0]))
@@ -1527,6 +1547,352 @@ static inline int __smolkvm_mailbox_create(struct smolkvm_vm *vm)
 #endif
 /* -- */
 
+/* Interrupt controller: a very basic 64-line IRQ status/mask/ack device */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_SIMPLE
+
+/*
+ * A minimal MMIO interrupt controller for up to 64 interrupt lines. It is a
+ * *polled* controller: it latches pending lines and exposes them to the guest,
+ * but does not (yet) inject anything into the vCPU -- the guest reads STATUS to
+ * see what needs servicing. The host (or another device) asserts a line with
+ * smolkvm_irq_raise().
+ *
+ * Each line is one bit, so all 64 fit in a single 64-bit register.
+ *
+ * Register map (all registers are 64-bit):
+ *   0x00  STATUS  (read)   asserted lines == pending & ~mask
+ *   0x08  MASK    (r/w)    a 1 bit masks (suppresses) that line
+ *   0x10  ACK     (write)  write a 1 bit to clear that pending line
+ */
+#define SMOLKVM_IRQCHIP_PHYS	(SMOLKVM_MMIO_HOLE_PHYS + 0x2000)
+#define SMOLKVM_IRQCHIP_LEN	0x20
+#define SMOLKVM_IRQCHIP_MAX_IRQ	64
+
+#define __SMOLKVM_IRQCHIP_REG_STATUS	0x00
+#define __SMOLKVM_IRQCHIP_REG_MASK	0x08
+#define __SMOLKVM_IRQCHIP_REG_ACK	0x10
+
+struct __smolkvm_irqchip_priv {
+	uint64_t pending;	/* latched lines, set by raise, cleared by ACK */
+	uint64_t mask;	/* bit set => line is masked (suppressed) */
+};
+
+static struct __smolkvm_irqchip_priv __smolkvm_irqchip_priv;
+
+static uint64_t __smolkvm_irqchip_read(struct smolkvm_vm *vm,
+									   struct smolkvm_mmio *mmio,
+									   uint64_t offset,
+									   uint8_t len)
+{
+	struct __smolkvm_irqchip_priv *ic = mmio->priv;
+
+	switch (offset) {
+	case __SMOLKVM_IRQCHIP_REG_STATUS:
+		/* Only report lines that are pending *and* not masked */
+		return ic->pending & ~ic->mask;
+	case __SMOLKVM_IRQCHIP_REG_MASK:
+		return ic->mask;
+	}
+
+	return 0;
+}
+
+static void __smolkvm_irqchip_write(struct smolkvm_vm *vm,
+									struct smolkvm_mmio *mmio,
+									uint64_t offset,
+									uint8_t len,
+									uint64_t value)
+{
+	struct __smolkvm_irqchip_priv *ic = mmio->priv;
+
+	switch (offset) {
+	case __SMOLKVM_IRQCHIP_REG_MASK:
+		ic->mask = value;
+		break;
+	case __SMOLKVM_IRQCHIP_REG_ACK:
+		/* Clear every pending line the guest acknowledged */
+		ic->pending &= ~value;
+		break;
+	default:
+		__smolkvm_debug("irqchip: write to read-only/unknown offset 0x%llx\n",
+						(unsigned long long) offset);
+		break;
+	}
+}
+
+static const struct smolkvm_mmio_reg __smolkvm_irqchip_regs[] = {
+	{ .name = "STATUS", .offset = __SMOLKVM_IRQCHIP_REG_STATUS, .size = 8 },
+	{ .name = "MASK",   .offset = __SMOLKVM_IRQCHIP_REG_MASK,   .size = 8 },
+	{ .name = "ACK",    .offset = __SMOLKVM_IRQCHIP_REG_ACK,    .size = 8 },
+};
+
+static struct smolkvm_mmio __smolkvm_irqchip = {
+	.name = "irqchip",
+	.phys = SMOLKVM_IRQCHIP_PHYS,
+	.len = SMOLKVM_IRQCHIP_LEN,
+	.regs = __smolkvm_irqchip_regs,
+	.num_regs = SMOLKVM_ARRAYSIZE(__smolkvm_irqchip_regs),
+	.write = __smolkvm_irqchip_write,
+	.read = __smolkvm_irqchip_read,
+	.priv = &__smolkvm_irqchip_priv,
+};
+
+/* Assert interrupt line `irq` (latches even if currently masked) */
+void smolkvm_irq_raise(struct smolkvm_vm *vm, unsigned int irq)
+{
+	(void) vm;
+
+	if (irq >= SMOLKVM_IRQCHIP_MAX_IRQ) {
+		printf("irq %u out of range (max %d)\n", irq, SMOLKVM_IRQCHIP_MAX_IRQ);
+		return;
+	}
+
+	__smolkvm_irqchip_priv.pending |= SMOLKVM_BIT(irq);
+}
+
+/* Deassert interrupt line `irq` without the guest having to ACK it */
+void smolkvm_irq_lower(struct smolkvm_vm *vm, unsigned int irq)
+{
+	(void) vm;
+
+	if (irq >= SMOLKVM_IRQCHIP_MAX_IRQ)
+		return;
+
+	__smolkvm_irqchip_priv.pending &= ~SMOLKVM_BIT(irq);
+}
+
+/* True if any line is asserted (pending and unmasked) -- the hook a real
+ * delivery path would use to decide whether to inject into the vCPU. */
+static inline bool smolkvm_irq_asserted(struct smolkvm_vm *vm)
+{
+	(void) vm;
+
+	return (__smolkvm_irqchip_priv.pending & ~__smolkvm_irqchip_priv.mask) != 0;
+}
+
+static inline int __smolkvm_irqchip_create(struct smolkvm_vm *vm)
+{
+	__smolkvm_irqchip_priv.pending = 0;
+	__smolkvm_irqchip_priv.mask = 0;	/* nothing masked by default */
+
+	return __smolkvm_plugin_mmio(vm, &__smolkvm_irqchip);
+}
+
+#endif /* SMOLKVM_WANT_SIMPLE */
+#endif
+/* -- */
+
+/* Timer: free-running counter + programmable one-shot */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_SIMPLE
+
+/*
+ * One MMIO device providing two things:
+ *
+ *   - a free-running counter that advances in real time at a programmable
+ *     frequency (think TSC / monotonic clock the guest can read), and
+ *   - a programmable one-shot that fires once after a set number of ticks,
+ *     raising an irqchip line (and latching an EXPIRED status bit).
+ *
+ * Time is read from the host's CLOCK_MONOTONIC. The one-shot is evaluated
+ * lazily on every register read and around each vCPU run (pre/post hooks), so
+ * in this polled model the guest sees it fire as soon as it next exits -- e.g.
+ * when it polls STATUS or the irqchip.
+ *
+ * Register map (all registers are 64-bit):
+ *   0x00  FREQ     (r/w)  counter ticks per second; writing restarts COUNTER
+ *   0x08  COUNTER  (r)    free-running tick count since boot / last FREQ write
+ *   0x10  ONESHOT  (r/w)  write N>0 to fire N ticks from now, 0 to disarm;
+ *                         read returns ticks remaining (0 if disarmed/fired)
+ *   0x18  STATUS   (r/w)  read bit0 = EXPIRED latch; write bit0 to clear it
+ *   0x20  IRQ      (r/w)  irqchip line raised when the one-shot fires
+ */
+#define SMOLKVM_TIMER_PHYS		(SMOLKVM_MMIO_HOLE_PHYS + 0x3000)
+#define SMOLKVM_TIMER_LEN		0x40
+#define SMOLKVM_TIMER_DEFAULT_FREQ	1000000ULL	/* 1 MHz -> 1 tick == 1us */
+#define SMOLKVM_TIMER_DEFAULT_IRQ	0
+
+#define __SMOLKVM_TIMER_REG_FREQ	0x00
+#define __SMOLKVM_TIMER_REG_COUNTER	0x08
+#define __SMOLKVM_TIMER_REG_ONESHOT	0x10
+#define __SMOLKVM_TIMER_REG_STATUS	0x18
+#define __SMOLKVM_TIMER_REG_IRQ		0x20
+
+#define SMOLKVM_TIMER_STATUS_EXPIRED	SMOLKVM_BIT(0)
+
+#define __SMOLKVM_NS_PER_SEC		1000000000ULL
+
+struct __smolkvm_timer_priv {
+	uint64_t freq;		/* ticks per second */
+	uint64_t base_ns;		/* monotonic ns where COUNTER reads zero */
+	uint64_t deadline_ns;	/* monotonic ns when the one-shot fires */
+	bool     armed;		/* one-shot armed */
+	bool     fired;		/* one-shot expiry latch */
+	unsigned int irq;		/* irqchip line raised on expiry */
+};
+
+static struct __smolkvm_timer_priv __smolkvm_timer_priv;
+
+static inline uint64_t __smolkvm_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	return (uint64_t) ts.tv_sec * __SMOLKVM_NS_PER_SEC + (uint64_t) ts.tv_nsec;
+}
+
+/* ns -> ticks, split to avoid overflow in the sub-second part */
+static inline uint64_t __smolkvm_ns_to_ticks(uint64_t ns, uint64_t freq)
+{
+	uint64_t secs = ns / __SMOLKVM_NS_PER_SEC;
+	uint64_t rem  = ns % __SMOLKVM_NS_PER_SEC;
+
+	return secs * freq + (rem * freq) / __SMOLKVM_NS_PER_SEC;
+}
+
+/* ticks -> ns (freq must be non-zero) */
+static inline uint64_t __smolkvm_ticks_to_ns(uint64_t ticks, uint64_t freq)
+{
+	uint64_t secs = ticks / freq;
+	uint64_t rem  = ticks % freq;
+
+	return secs * __SMOLKVM_NS_PER_SEC + (rem * __SMOLKVM_NS_PER_SEC) / freq;
+}
+
+/* Fire the one-shot if its deadline has passed. Idempotent. */
+static void __smolkvm_timer_update(struct smolkvm_vm *vm, struct __smolkvm_timer_priv *t)
+{
+	if (t->armed && __smolkvm_now_ns() >= t->deadline_ns) {
+		t->armed = false;
+		t->fired = true;
+		smolkvm_irq_raise(vm, t->irq);
+	}
+}
+
+static uint64_t __smolkvm_timer_read(struct smolkvm_vm *vm,
+				     struct smolkvm_mmio *mmio,
+				     uint64_t offset,
+				     uint8_t len)
+{
+	struct __smolkvm_timer_priv *t = mmio->priv;
+	uint64_t now;
+
+	__smolkvm_timer_update(vm, t);
+
+	switch (offset) {
+	case __SMOLKVM_TIMER_REG_FREQ:
+		return t->freq;
+	case __SMOLKVM_TIMER_REG_COUNTER:
+		return __smolkvm_ns_to_ticks(__smolkvm_now_ns() - t->base_ns, t->freq);
+	case __SMOLKVM_TIMER_REG_ONESHOT:
+		if (!t->armed)
+			return 0;
+		now = __smolkvm_now_ns();
+		if (now >= t->deadline_ns)
+			return 0;
+		return __smolkvm_ns_to_ticks(t->deadline_ns - now, t->freq);
+	case __SMOLKVM_TIMER_REG_STATUS:
+		return t->fired ? SMOLKVM_TIMER_STATUS_EXPIRED : 0;
+	case __SMOLKVM_TIMER_REG_IRQ:
+		return t->irq;
+	}
+
+	return 0;
+}
+
+static void __smolkvm_timer_write(struct smolkvm_vm *vm,
+				  struct smolkvm_mmio *mmio,
+				  uint64_t offset,
+				  uint8_t len,
+				  uint64_t value)
+{
+	struct __smolkvm_timer_priv *t = mmio->priv;
+
+	switch (offset) {
+	case __SMOLKVM_TIMER_REG_FREQ:
+		if (value == 0) {
+			printf("timer: frequency 0 ignored\n");
+			break;
+		}
+		t->freq = value;
+		t->base_ns = __smolkvm_now_ns();	/* restart the counter at the new rate */
+		break;
+	case __SMOLKVM_TIMER_REG_ONESHOT:
+		if (value == 0) {			/* disarm */
+			t->armed = false;
+			break;
+		}
+		if (t->freq == 0) {
+			printf("timer: cannot arm one-shot, frequency is 0\n");
+			break;
+		}
+		t->deadline_ns = __smolkvm_now_ns() + __smolkvm_ticks_to_ns(value, t->freq);
+		t->armed = true;
+		t->fired = false;
+		break;
+	case __SMOLKVM_TIMER_REG_STATUS:
+		if (value & SMOLKVM_TIMER_STATUS_EXPIRED)	/* write-1-to-clear */
+			t->fired = false;
+		break;
+	case __SMOLKVM_TIMER_REG_IRQ:
+		if (value >= SMOLKVM_IRQCHIP_MAX_IRQ) {
+			printf("timer: irq %llu out of range\n", (unsigned long long) value);
+			break;
+		}
+		t->irq = (unsigned int) value;
+		break;
+	default:
+		__smolkvm_debug("timer: write to unknown offset 0x%llx\n",
+						(unsigned long long) offset);
+		break;
+	}
+}
+
+/* Evaluated around every vCPU run so the one-shot can fire between exits */
+static void __smolkvm_timer_tick(struct smolkvm_vm *vm, struct smolkvm_mmio *mmio)
+{
+	__smolkvm_timer_update(vm, mmio->priv);
+}
+
+static const struct smolkvm_mmio_reg __smolkvm_timer_regs[] = {
+	{ .name = "FREQ",    .offset = __SMOLKVM_TIMER_REG_FREQ,    .size = 8 },
+	{ .name = "COUNTER", .offset = __SMOLKVM_TIMER_REG_COUNTER, .size = 8 },
+	{ .name = "ONESHOT", .offset = __SMOLKVM_TIMER_REG_ONESHOT, .size = 8 },
+	{ .name = "STATUS",  .offset = __SMOLKVM_TIMER_REG_STATUS,  .size = 8 },
+	{ .name = "IRQ",     .offset = __SMOLKVM_TIMER_REG_IRQ,     .size = 8 },
+};
+
+static struct smolkvm_mmio __smolkvm_timer = {
+	.name = "timer",
+	.phys = SMOLKVM_TIMER_PHYS,
+	.len = SMOLKVM_TIMER_LEN,
+	.regs = __smolkvm_timer_regs,
+	.num_regs = SMOLKVM_ARRAYSIZE(__smolkvm_timer_regs),
+	.pre_run = __smolkvm_timer_tick,
+	.post_run = __smolkvm_timer_tick,
+	.write = __smolkvm_timer_write,
+	.read = __smolkvm_timer_read,
+	.priv = &__smolkvm_timer_priv,
+};
+
+static inline int __smolkvm_timer_create(struct smolkvm_vm *vm)
+{
+	__smolkvm_timer_priv.freq = SMOLKVM_TIMER_DEFAULT_FREQ;
+	__smolkvm_timer_priv.base_ns = __smolkvm_now_ns();
+	__smolkvm_timer_priv.deadline_ns = 0;
+	__smolkvm_timer_priv.armed = false;
+	__smolkvm_timer_priv.fired = false;
+	__smolkvm_timer_priv.irq = SMOLKVM_TIMER_DEFAULT_IRQ;
+
+	return __smolkvm_plugin_mmio(vm, &__smolkvm_timer);
+}
+
+#endif /* SMOLKVM_WANT_SIMPLE */
+#endif
+/* -- */
+
 /* VM creation and teardown */
 #ifdef SMOLKVM_FOLD
 
@@ -1664,6 +2030,14 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 
 	/* Plug in the mailbox so the guest can ask us to do things */
 	__smolkvm_mailbox_create(vm);
+
+#ifdef SMOLKVM_WANT_SIMPLE
+	/* Plug in the interrupt controller */
+	__smolkvm_irqchip_create(vm);
+
+	/* Plug in the timer */
+	__smolkvm_timer_create(vm);
+#endif
 
 	return 0;
 }
