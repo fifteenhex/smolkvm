@@ -1,3 +1,7 @@
+# Must be defined before it appears in a prerequisite list: make expands
+# prerequisites when it reads the rule, so a later definition is just empty.
+IPL=ipl/build/ipl
+
 all: smolkvm_test_gdb_libc \
 	smolkvm_test_debug_libc \
 	smolkvm_test_debug_gdb_libc \
@@ -10,8 +14,6 @@ all: smolkvm_test_gdb_libc \
 COPTS= -ggdb \
 	-std=c99 \
 	-Os
-
-IPL=ipl/build/ipl
 
 ipl/include/machine.h: smolkvm_test_libc
 	./smolkvm_test_libc -h $@
