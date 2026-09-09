@@ -589,6 +589,230 @@ static inline int __smolkvm_handle_io(struct smolkvm_vm *vm)
 #endif
 /* -- */
 
+/* Everyone loves a console */
+#ifdef SMOLKVM_FOLD
+
+/* todo, fix these offsets once I decide the register layout */
+#define __SMOLKVM_CONSOLE_REG_STATUS	1
+#define __SMOLKVM_CONSOLE_REG_TXRX	0
+
+struct __smolkvm_console_fifo {
+	uint8_t fifo[64];
+	unsigned head;
+	unsigned tail;
+};
+
+bool __smolkvm_fifo_is_empty(struct __smolkvm_console_fifo *fifo)
+{
+	return fifo->head == fifo->tail;
+}
+
+bool __smolkvm_fifo_is_full(struct __smolkvm_console_fifo *fifo)
+{
+	return ((fifo->head + 1) % SMOLKVM_ARRAYSIZE(fifo->fifo)) == fifo->tail;
+}
+
+uint8_t __smolkvm_fifo_consume(struct __smolkvm_console_fifo *fifo)
+{
+	uint8_t item = fifo->fifo[fifo->tail];
+	fifo->tail = (fifo->tail + 1) % SMOLKVM_ARRAYSIZE(fifo->fifo);
+
+	return item;
+}
+
+struct {
+	int listen_socket;
+	int connected_socket;
+
+	struct __smolkvm_console_fifo fifo_rx;
+} __smolkvm_console_priv;
+
+static void __smolkvm_console_disconnect(void)
+{
+	if (__smolkvm_console_priv.connected_socket >= 0) {
+		__smolkvm_debug("console client went away\n");
+		close(__smolkvm_console_priv.connected_socket);
+		__smolkvm_console_priv.connected_socket = -1;
+	}
+}
+
+static void __smolkvm_console_check_for_data_from_socket(struct smolkvm_vm *vm,
+							 struct smolkvm_mmio *mmio)
+{
+	int connected_socket = __smolkvm_console_priv.connected_socket;
+	struct __smolkvm_console_fifo *fifo_rx = &__smolkvm_console_priv.fifo_rx;
+	int ret;
+
+	if (connected_socket < 0)
+		return;
+
+	while (!__smolkvm_fifo_is_full(fifo_rx)) {
+		uint8_t *dst = &fifo_rx->fifo[fifo_rx->head];
+
+		ret = read(connected_socket, dst, 1);
+		if (ret == 0) {
+			/* Orderly shutdown from the other end */
+			__smolkvm_console_disconnect();
+			return;
+		}
+		if (ret < 0)
+			return;
+
+		__smolkvm_debug("read %d from console socket\n", ret);
+		fifo_rx->head = (fifo_rx->head + 1) % SMOLKVM_ARRAYSIZE(fifo_rx->fifo);
+	}
+}
+
+/*
+ * Push one guest transmitted byte out: to the connected console client if
+ * there is one, and always mirrored to our own stdout so boot output is
+ * visible without attaching to the socket.
+ */
+static void __smolkvm_console_tx_byte(uint8_t ch)
+{
+	int connected_socket = __smolkvm_console_priv.connected_socket;
+
+	if (connected_socket >= 0) {
+		ssize_t wret;
+
+		/*
+		 * Our own SIGIO (client data arriving) can interrupt the send,
+		 * so retry EINTR. EAGAIN means the client isn't draining; drop
+		 * the byte rather than block or drop the client (stdout still
+		 * gets it). MSG_NOSIGNAL: a disappearing client must not
+		 * SIGPIPE us; it shows up as an error and disconnects instead.
+		 */
+		do {
+			wret = send(connected_socket, &ch, 1, MSG_NOSIGNAL);
+		} while (wret < 0 && errno == EINTR);
+
+		if (wret < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+			__smolkvm_console_disconnect();
+	}
+
+	putchar(ch);
+	fflush(stdout);
+}
+
+static int __smolkvm_console_check_for_connection(struct smolkvm_vm *vm,
+						   struct smolkvm_mmio *mmio)
+{
+	struct sockaddr_in client_addr;
+	socklen_t addr_len = sizeof(client_addr);
+	int conn_socket;
+
+	conn_socket = accept4(__smolkvm_console_priv.listen_socket,
+		      (struct sockaddr *)&client_addr, &addr_len, O_NONBLOCK);
+	if (conn_socket < 0) {
+		/* No one connected, that's sad but ok */
+		if (errno == EAGAIN)
+			return 0;
+
+		printf("accept failed for console: %d, errno %d\n", conn_socket, errno);
+		return -1;
+	}
+
+	__smolkvm_debug("someone connected to the console socket\n");
+	/* A new client replaces any existing one; don't leak the old fd */
+	__smolkvm_console_disconnect();
+	/* Data arriving must raise SIGIO too, to kick us out of KVM_RUN */
+	__smolkvm_make_socket_trigger_sigio(conn_socket);
+	__smolkvm_console_priv.connected_socket = conn_socket;
+
+	return 1;
+}
+
+static void __smolkvm_console_pre_run(struct smolkvm_vm *vm,
+				      struct smolkvm_mmio *mmio)
+{
+	__smolkvm_console_check_for_connection(vm, mmio);
+	__smolkvm_console_check_for_data_from_socket(vm, mmio);
+}
+
+static uint64_t __smolkvm_console_read(struct smolkvm_vm *vm,
+				       struct smolkvm_mmio *mmio,
+				       uint64_t offset,
+				       uint8_t len)
+{
+	struct __smolkvm_console_fifo *fifo_rx = &__smolkvm_console_priv.fifo_rx;
+
+	if (len != 1)
+		return 0;
+
+	switch (offset) {
+	case __SMOLKVM_CONSOLE_REG_STATUS:
+		if (!__smolkvm_fifo_is_empty(fifo_rx))
+			return 1;
+		break;
+	case __SMOLKVM_CONSOLE_REG_TXRX:
+		if (!__smolkvm_fifo_is_empty(fifo_rx))
+			return __smolkvm_fifo_consume(fifo_rx);
+		break;
+	}
+
+	return 0;
+}
+
+static void __smolkvm_console_write(struct smolkvm_vm *vm,
+				    struct smolkvm_mmio *mmio,
+				    uint64_t offset,
+				    uint8_t len,
+				    uint64_t value)
+{
+	if (offset == __SMOLKVM_CONSOLE_REG_TXRX && len == 1)
+		__smolkvm_console_tx_byte((uint8_t) value);
+}
+
+static void __smolkvm_console_post_run(struct smolkvm_vm *vm,
+				      struct smolkvm_mmio *mmio)
+{
+	__smolkvm_console_check_for_connection(vm, mmio);
+}
+
+#define SMOLKVM_CONSOLE_PHYS (SMOLKVM_MMIO_HOLE_PHYS + 0x0000)
+
+static const struct smolkvm_mmio_reg __smolkvm_console_regs[] = {
+	{ .name = "TXRX",   .offset = __SMOLKVM_CONSOLE_REG_TXRX,   .size = 1 },
+	{ .name = "STATUS", .offset = __SMOLKVM_CONSOLE_REG_STATUS, .size = 1 },
+};
+
+static struct smolkvm_mmio __smolkvm_console = {
+	.name = "console",
+	.phys = SMOLKVM_CONSOLE_PHYS,
+	.len = 8,
+	.regs = __smolkvm_console_regs,
+	.num_regs = SMOLKVM_ARRAYSIZE(__smolkvm_console_regs),
+	.pre_run = __smolkvm_console_pre_run,
+	.write = __smolkvm_console_write,
+	.read = __smolkvm_console_read,
+	.post_run = __smolkvm_console_post_run,
+	.priv = &__smolkvm_console_priv,
+};
+
+static inline int __smolkvm_console_create(struct smolkvm_vm *vm)
+{
+	int listen_sock;
+
+	__smolkvm_console_priv.connected_socket = -1;
+	__smolkvm_console_priv.fifo_rx.head = 0;
+	__smolkvm_console_priv.fifo_rx.tail = 0;
+
+	listen_sock = __smolkvm_create_unix_domain_socket("/tmp/smolkvmconsole");
+	if (listen_sock < 0)
+		return 1;
+
+	__smolkvm_make_socket_trigger_sigio(listen_sock);
+
+	__smolkvm_console_priv.listen_socket = listen_sock;
+
+	__smolkvm_plugin_mmio(vm, &__smolkvm_console);
+
+	return 0;
+}
+
+#endif
+/* -- */
+
 /* Read/Write into guest memory */
 #ifdef SMOLKVM_FOLD
 
@@ -1100,6 +1324,9 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 	__smolkvm_sigio_kvm_run = vcpu_run;
 	__smolkvm_setup_sighandler();
 //
+
+	/* Plug in the console .. boop beep boop */
+	__smolkvm_console_create(vm);
 
 	return 0;
 }
