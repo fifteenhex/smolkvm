@@ -55,6 +55,7 @@
  *   SMOLKVM_MEMREGIONS_NUM       -- How many memory regions are possible, see default below.
  *   SMOLKVM_MMIOREGIONS_NUM      -- How many mmio, device, regions are possible, see default below.
  *   SMOLKVM_WANT_SIMPLE          -- Machine with the simple polled irqchip + timer (default).
+ *   SMOLKVM_WANT_APIC            -- Machine with the in-kernel APIC + PIT (boots stock OSes).
  */
 #ifdef SMOLKVM_FOLD
 
@@ -86,6 +87,18 @@
 #endif
 #if !defined(SMOLKVM_WANT_SIMPLE) && !defined(SMOLKVM_WANT_APIC)
 #define SMOLKVM_WANT_SIMPLE
+#endif
+/* -- */
+
+/*
+ * Fixed locations of KVM's in-kernel controllers, so the IPL can build a MADT
+ * that matches what KVM_CREATE_IRQCHIP actually emulates. These are the x86
+ * architectural defaults.
+ */
+#ifdef SMOLKVM_WANT_APIC
+#define SMOLKVM_APIC_LAPIC_BASE		0xFEE00000ULL
+#define SMOLKVM_APIC_IOAPIC_BASE	0xFEC00000ULL
+#define SMOLKVM_APIC_IOAPIC_GSI_BASE	0
 #endif
 /* -- */
 
@@ -128,6 +141,8 @@
 #define SMOLKVM_ERR_UNHANDLED_EXIT  113
 #define SMOLKVM_ERR_GET_CPUID       114
 #define SMOLKVM_ERR_SET_CPUID       115
+#define SMOLKVM_ERR_CREATE_IRQCHIP  116
+#define SMOLKVM_ERR_CREATE_PIT      117
 
 #endif
 /* -- */
@@ -1934,6 +1949,42 @@ static int __smolkvm_setup_cpuid(struct smolkvm_vm *vm)
 	return 0;
 }
 
+#ifdef SMOLKVM_WANT_APIC
+/*
+ * Create the in-kernel interrupt controller (PIC + IOAPIC + per-vCPU LAPIC)
+ * and the 8254 PIT that a stock OS expects. Must run after KVM_CREATE_VM but
+ * before KVM_CREATE_VCPU, so the vCPU comes up with an in-kernel local APIC.
+ * With this in place a guest HLT halts in-kernel and wakes on an interrupt
+ * rather than exiting to us.
+ */
+static int __smolkvm_create_kernel_irqchip(int vm_fd)
+{
+	/*
+	 * SPEAKER_DUMMY makes KVM emulate port 0x61 too; Linux's TSC
+	 * calibration pokes the PIT channel 2 gate in there and gets confused
+	 * by the 0xFF our unhandled-port fallback would return.
+	 */
+	struct kvm_pit_config pit = {
+		.flags = KVM_PIT_SPEAKER_DUMMY,
+	};
+	int ret;
+
+	ret = ioctl(vm_fd, KVM_CREATE_IRQCHIP, 0);
+	if (ret < 0) {
+		__smolkvm_debug("KVM_CREATE_IRQCHIP failed: %d\n", ret);
+		return -SMOLKVM_ERR_CREATE_IRQCHIP;
+	}
+
+	ret = ioctl(vm_fd, KVM_CREATE_PIT2, &pit);
+	if (ret < 0) {
+		__smolkvm_debug("KVM_CREATE_PIT2 failed: %d\n", ret);
+		return -SMOLKVM_ERR_CREATE_PIT;
+	}
+
+	return 0;
+}
+#endif
+
 int smolkvm_create_vm(struct smolkvm_vm *vm)
 {
 	struct kvm_userspace_memory_region *memory_region = &vm->memregions[0];
@@ -1950,6 +2001,13 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 	vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0);
 	if (vm_fd < 0)
 		return -SMOLKVM_ERR_CREATEVM;
+
+#ifdef SMOLKVM_WANT_APIC
+	/* Must precede KVM_CREATE_VCPU so the vCPU gets an in-kernel LAPIC */
+	ret = __smolkvm_create_kernel_irqchip(vm_fd);
+	if (ret)
+		return ret;
+#endif
 
 	vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0);
 	if (vcpu_fd < 0)
