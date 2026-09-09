@@ -2127,6 +2127,126 @@ static inline int __smolkvm_timer_create(struct smolkvm_vm *vm)
 #endif
 /* -- */
 
+/* ELF loading */
+#ifdef SMOLKVM_FOLD
+
+int smolkvm_load_elf_with_displacement(struct smolkvm_vm *vm, const void *elf_image, int64_t displacement, uint64_t *entry)
+{
+	Elf64_Ehdr *ehdr = (Elf64_Ehdr *) elf_image;
+	Elf64_Phdr *phdrs;
+	int i;
+
+	if (!(ehdr->e_ident[EI_MAG0] == ELFMAG0 &&
+	      ehdr->e_ident[EI_MAG1] == ELFMAG1 &&
+	      ehdr->e_ident[EI_MAG2] == ELFMAG2 &&
+	      ehdr->e_ident[EI_MAG3] == ELFMAG3))
+	{
+		 printf("ELF ident looks wrong\n");
+		 return -1;
+	}
+
+	if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+		printf("Bad ELF class\n");
+		return -1;
+	}
+
+	if (ehdr->e_machine != EM_X86_64) {
+		printf("Bad ELF machine\n");
+		return -1;
+	}
+
+	/* Good enough?? */
+	phdrs = (Elf64_Phdr *) (elf_image + ehdr->e_phoff);
+	for (i = 0; i < ehdr->e_phnum; i++) {
+		const Elf64_Phdr *phdr = &phdrs[i];
+		uint64_t dst = phdr->p_paddr + displacement;
+
+		if (phdr->p_type != PT_LOAD)
+			continue;
+
+		if (__smolkvm_memory_write(vm, dst, phdr->p_filesz,
+					   elf_image + phdr->p_offset)) {
+			printf("failed to load segment %d "
+			       "(0x%llx bytes at gpa 0x%llx) -- no RAM there?\n",
+			       i, (unsigned long long) phdr->p_filesz,
+			       (unsigned long long) dst);
+			return -1;
+		}
+
+		/* Zero the tail of segments whose memory image is larger
+		 * than their file image (e.g. .bss). */
+		if (phdr->p_memsz > phdr->p_filesz &&
+		    __smolkvm_memory_set(vm, dst + phdr->p_filesz,
+					 phdr->p_memsz - phdr->p_filesz, 0)) {
+			printf("failed to zero the tail of segment %d\n", i);
+			return -1;
+		}
+	}
+
+	if (entry)
+		*entry = ehdr->e_entry + displacement;
+
+	return 0;
+}
+
+int smolkvm_load_elf(struct smolkvm_vm *vm, const void *elf_image, uint64_t *entry)
+{
+	return smolkvm_load_elf_with_displacement(vm, elf_image, 0, entry);
+}
+
+int smolkvm_load_elf_file_with_displacement(struct smolkvm_vm *vm, const char *elf_path, int64_t displacement, uint64_t *entry)
+{
+	struct stat st;
+	void *elf_image;
+	ssize_t got;
+	int ret;
+	int elf;
+
+	elf = open(elf_path, O_RDONLY);
+	if (elf < 0) {
+		printf("Failed to open ELF: %d\n", elf);
+		return -1;
+	}
+
+	if (fstat(elf, &st) < 0 || st.st_size <= 0) {
+		printf("Failed to stat ELF\n");
+		close(elf);
+		return -1;
+	}
+
+	elf_image = malloc((size_t) st.st_size);
+	if (!elf_image) {
+		printf("Failed to malloc() memory for IPL ELF image\n");
+		close(elf);
+		return -1;
+	}
+
+	got = read(elf, elf_image, (size_t) st.st_size);
+	close(elf);
+
+	if (got != st.st_size) {
+		printf("Failed to read ELF image: %zd\n", got);
+		free(elf_image);
+		return -1;
+	}
+
+	printf("Read %zd bytes of ELF image\n", got);
+
+	ret = smolkvm_load_elf_with_displacement(vm, elf_image, displacement, entry);
+	free(elf_image);
+	if (ret)
+		return -1;
+
+	return 0;
+}
+
+int smolkvm_load_elf_file(struct smolkvm_vm *vm, const char *elf_path, uint64_t *entry)
+{
+	return smolkvm_load_elf_file_with_displacement(vm, elf_path, 0, entry);
+}
+#endif
+/* -- */
+
 /* VM creation and teardown */
 #ifdef SMOLKVM_FOLD
 
