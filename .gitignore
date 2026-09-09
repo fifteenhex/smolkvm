@@ -1,7 +1,11 @@
 *.o
 /smolkvm_test
 /smolkvm_test_gdb
-/smolkvm_test_libc
-/smolkvm_test_debug_libc
-/smolkvm_test_gdb_libc
-/smolkvm_test_debug_gdb_libc
+/smolkvm_test_simple_libc
+/smolkvm_test_simple_debug_libc
+/smolkvm_test_simple_gdb_libc
+/smolkvm_test_simple_debug_gdb_libc
+/smolkvm_test_apic_libc
+/smolkvm_test_apic_debug_libc
+/smolkvm_test_apic_gdb_libc
+/smolkvm_test_apic_debug_gdb_libc

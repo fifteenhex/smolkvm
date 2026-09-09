@@ -39,7 +39,7 @@ just works; output is mirrored to stdout and to the unix socket.
 
 ```
 make
-./smolkvm_test_libc -k /path/to/vmlinux -r initramfs.cpio.gz -c "console=ttyS0 rdinit=/bin/sh"
+./smolkvm_test_apic_libc -k /path/to/vmlinux -r initramfs.cpio.gz -c "console=ttyS0 rdinit=/bin/sh"
 ```
 
 `-m` sets the RAM size in MB (default 64). The kernel needs
