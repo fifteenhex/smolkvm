@@ -1,0 +1,8 @@
+# Generated / cloned by Makefile.test (kept out of the repo)
+linux-*/
+linux-*.tar.xz
+linux-*.tar.xz.tmp
+.linux-*.extracted
+smolutils/
+tarwak/
+smoke.log

@@ -1,0 +1,165 @@
+# Smoke test: download a Linux kernel and smolutils, build a minimal vmlinux
+# with the shipped config, use smolutils as the initramfs, and boot the whole
+# lot under smolkvm -- passing if the guest reaches an interactive shell.
+#
+#   make -f Makefile.test smoke     # the whole pipeline
+#   make -f Makefile.test kernel    # just build vmlinux
+#   make -f Makefile.test initramfs # just build the smolutils initramfs
+#   make -f Makefile.test clean     # drop build products (keep the downloads)
+#
+# Needs KVM (the boot runs a real VM) and, on Debian / Ubuntu:
+#   build-essential flex bison bc libelf-dev libssl-dev   # kernel (libelf is
+#                                                          # for objtool)
+#   git meson libarchive-dev libcjson-dev libcap-dev      # tarwak
+#   libarchive-tools                                      # bsdtar, for the cpio
+
+# Everything generated lives under test/ so one .gitignore covers it and the
+# repo root stays clean.
+WORK := test
+
+KERNEL_VERSION := 7.2
+KERNEL_MAJOR   := $(firstword $(subst ., ,$(KERNEL_VERSION)))
+KERNEL_SRC     := $(WORK)/linux-$(KERNEL_VERSION)
+KERNEL_TARBALL := $(WORK)/linux-$(KERNEL_VERSION).tar.xz
+KERNEL_URL     := https://cdn.kernel.org/pub/linux/kernel/v$(KERNEL_MAJOR).x/linux-$(KERNEL_VERSION).tar.xz
+KERNEL_STAMP   := $(WORK)/.linux-$(KERNEL_VERSION).extracted
+
+# Out-of-tree build so re-extracting is never needed and the source stays clean.
+KOUT    := $(CURDIR)/$(KERNEL_SRC)/smolkvm-build
+VMLINUX := $(KOUT)/vmlinux
+CONFIG  := $(CURDIR)/$(WORK)/kernel.config
+
+# --- userspace: smolutils ----------------------------------------------------
+
+SMOLUTILS_URL := https://github.com/fifteenhex/smolutils.git
+TARWAK_URL    := https://github.com/fifteenhex/tarwak.git
+
+SMOLUTILS_SRC := $(WORK)/smolutils
+TARWAK_SRC    := $(WORK)/tarwak
+TARWAK_BIN    := $(CURDIR)/$(TARWAK_SRC)/build/tarwak
+
+# smolutils builds against nolibc; take it from the kernel tree we already
+# unpack rather than fetching a second copy.
+NOLIBCDIR := $(CURDIR)/$(KERNEL_SRC)/tools/include/nolibc
+
+# Building x86-64 on x86-64: the host's triple-prefixed toolchain is a fine
+# "cross" toolchain, so no separate download.
+SMOLUTILS_CROSS := x86_64-linux-gnu-
+SMOLUTILS_UAPI  := /usr/include /usr/include/x86_64-linux-gnu
+
+# The net utilities want socket headers nolibc does not ship, and the smoke
+# boot has no network anyway, so leave them out.
+SMOLUTILS_FEATURE_DISABLE := net
+
+INITRAMFS := $(CURDIR)/$(SMOLUTILS_SRC)/x86_64.cpio.gz
+
+# Built by the main Makefile.
+SMOLKVM := smolkvm_test_apic_libc
+IPL     := ipl/build/ipl
+
+SMOKE_TIMEOUT := 90
+# Everything after `--` is passed to smolutils' init (see its README).
+SMOKE_CMDLINE := console=ttyS0 earlycon=uart8250,io,0x3f8 -- smolinit.getty=/dev/ttyS0 smolinit.hostname=smolkvm
+SMOKE_LOG     := test/smoke.log
+# smolsh prints "smolsh <cwd> > " once getty has a shell -- reaching it means we
+# booted all the way to an interactive userspace.
+SMOKE_MARKER  := smolsh
+
+NPROC := $(shell nproc 2>/dev/null || echo 1)
+
+# --- kernel source -----------------------------------------------------------
+
+$(KERNEL_TARBALL):
+	mkdir -p $(WORK)
+	curl -fL --retry 3 --retry-delay 2 -o $@.tmp '$(KERNEL_URL)'
+	mv $@.tmp $@
+
+$(KERNEL_STAMP): $(KERNEL_TARBALL)
+	rm -rf $(KERNEL_SRC)
+	tar -C $(WORK) -xf $(KERNEL_TARBALL)
+	touch $@
+
+kernel-src: $(KERNEL_STAMP)
+.PHONY: kernel-src
+
+# --- vmlinux -----------------------------------------------------------------
+
+$(VMLINUX): $(KERNEL_STAMP) $(CONFIG)
+	$(MAKE) -C $(KERNEL_SRC) O=$(KOUT) allnoconfig KCONFIG_ALLCONFIG=$(CONFIG)
+	$(MAKE) -C $(KERNEL_SRC) O=$(KOUT) -j$(NPROC) vmlinux
+
+kernel: $(VMLINUX)
+.PHONY: kernel
+
+# --- smolutils initramfs -----------------------------------------------------
+
+$(SMOLUTILS_SRC):
+	git clone --depth 1 $(SMOLUTILS_URL) $@
+
+$(TARWAK_SRC):
+	git clone --depth 1 $(TARWAK_URL) $@
+
+$(TARWAK_BIN): | $(TARWAK_SRC)
+	cd $(TARWAK_SRC) && meson setup build && meson compile -C build
+
+# nolibc lives in the kernel tree, so that has to be unpacked first. NOPIE=1
+# builds plain -static rather than static-PIE, which is what upstream nolibc
+# (what the kernel tarball ships) supports.
+$(INITRAMFS): $(KERNEL_STAMP) $(TARWAK_BIN) | $(SMOLUTILS_SRC)
+	$(MAKE) -C $(SMOLUTILS_SRC) -f Makefile.x86_64 \
+		UAPIDIR="$(SMOLUTILS_UAPI)" \
+		NOLIBCDIR=$(NOLIBCDIR) \
+		CROSS_COMPILE=$(SMOLUTILS_CROSS) \
+		TARWAK=$(TARWAK_BIN) \
+		FEATURE_DISABLE=$(SMOLUTILS_FEATURE_DISABLE) \
+		NOPIE=1 \
+		x86_64.cpio.gz
+
+initramfs: $(INITRAMFS)
+.PHONY: initramfs
+
+# --- the smoke test ----------------------------------------------------------
+
+# Build the smolkvm side via the main Makefile so we always test current code.
+smolkvm-bits:
+	$(MAKE) $(SMOLKVM) $(IPL)
+.PHONY: smolkvm-bits
+
+# Boot in the background and stop the moment the marker appears. SMOKE_TIMEOUT
+# is only the failure cap.
+smoke: $(VMLINUX) $(INITRAMFS) smolkvm-bits
+	@echo "=== booting $(KERNEL_SRC) + smolutils under smolkvm ==="
+	@rm -f $(SMOKE_LOG)
+	@./$(SMOLKVM) -k $(VMLINUX) -r $(INITRAMFS) -c "$(SMOKE_CMDLINE)" \
+		> $(SMOKE_LOG) 2>&1 & \
+	pid=$$!; \
+	ok=0; \
+	for i in $$(seq 1 $(SMOKE_TIMEOUT)); do \
+		if grep -q "$(SMOKE_MARKER)" $(SMOKE_LOG) 2>/dev/null; then ok=1; break; fi; \
+		kill -0 $$pid 2>/dev/null || break; \
+		sleep 1; \
+	done; \
+	kill $$pid 2>/dev/null; wait $$pid 2>/dev/null; \
+	if [ $$ok = 1 ]; then \
+		echo "SMOKE PASS (reached an interactive shell)"; \
+	else \
+		echo "SMOKE FAIL -- last lines of $(SMOKE_LOG):"; \
+		tail -n 20 $(SMOKE_LOG); \
+		exit 1; \
+	fi
+.PHONY: smoke
+
+# --- cleanup -----------------------------------------------------------------
+
+# Build products, but keep the downloaded/cloned sources.
+clean:
+	rm -rf $(KOUT) $(SMOKE_LOG)
+	-$(MAKE) -C $(SMOLUTILS_SRC) -f Makefile.x86_64 \
+		NOLIBCDIR=$(NOLIBCDIR) CROSS_COMPILE=$(SMOLUTILS_CROSS) TARWAK=none clean 2>/dev/null
+.PHONY: clean
+
+# Everything, including the kernel tarball and the smolutils / tarwak clones.
+distclean:
+	rm -rf $(KERNEL_SRC) $(KERNEL_STAMP) $(KERNEL_TARBALL) \
+		$(SMOLUTILS_SRC) $(TARWAK_SRC) $(SMOKE_LOG)
+.PHONY: distclean
