@@ -53,11 +53,16 @@
  * Configuration defines:
  *   SMOLKVM_DEBUG                -- Be very noisy about what is going on to help with working out what is broken.
  *   SMOLKVM_MEMREGIONS_NUM       -- How many memory regions are possible, see default below.
+ *   SMOLKVM_MMIOREGIONS_NUM      -- How many mmio, device, regions are possible, see default below.
  */
 #ifdef SMOLKVM_FOLD
 
 #ifndef SMOLKVM_MEMREGIONS_NUM
 #define SMOLKVM_MEMREGIONS_NUM		8
+#endif
+
+#ifndef SMOLKVM_MMIOREGIONS_NUM
+#define SMOLKVM_MMIOREGIONS_NUM		8
 #endif
 
 /* Utility macros */
@@ -95,6 +100,8 @@
 #define SMOLKVM_ERR_CREATE_SETSREGS 109
 #define SMOLKVM_ERR_CREATE_GETREGS  110
 #define SMOLKVM_ERR_CREATE_SETREGS  111
+#define SMOLKVM_ERR_MMIO_NO_DEVICE  112
+#define SMOLKVM_ERR_UNHANDLED_EXIT  113
 #define SMOLKVM_ERR_GET_CPUID       114
 #define SMOLKVM_ERR_SET_CPUID       115
 
@@ -178,6 +185,41 @@ struct smolkvm_pgtable {
 	uint64_t entries[SMOLKVM_X86_PTE_NUM];
 };
 
+struct smolkvm_vm;
+
+struct smolkvm_mmio_reg {
+	const char *name;
+	uint64_t offset;
+	uint64_t size;
+};
+
+struct smolkvm_mmio {
+	const char *name;
+	uint64_t phys;
+	uint64_t len;
+
+	const struct smolkvm_mmio_reg *regs;
+	size_t num_regs;
+
+	void (*pre_run)(struct smolkvm_vm *vm,
+			struct smolkvm_mmio *mmio);
+
+	void (*write)(struct smolkvm_vm *vm,
+		      struct smolkvm_mmio *mmio,
+		      uint64_t offset,
+		      uint8_t len,
+		      uint64_t value);
+	uint64_t (*read)(struct smolkvm_vm *vm,
+			 struct smolkvm_mmio *mmio,
+		         uint64_t offset,
+			 uint8_t len);
+
+	void (*post_run)(struct smolkvm_vm *vm,
+			 struct smolkvm_mmio *mmio);
+
+	void *priv;
+};
+
 
 struct smolkvm_vm {
 	int vcpu_fd;
@@ -191,7 +233,12 @@ struct smolkvm_vm {
 	/* Running count only; per-slot occupancy (memory_size != 0) is authoritative */
 	unsigned int memory_region_plugged_in;
 
+	struct smolkvm_mmio *mmioregions[SMOLKVM_MMIOREGIONS_NUM];
+	/* Running count only; per-slot occupancy (pointer != NULL) is authoritative */
+	unsigned int mmio_plugged_in;
 
+
+	bool was_interrupted;
 };
 
 #endif
@@ -271,6 +318,142 @@ static inline int __smolkvm_set_guest_debug(struct smolkvm_vm *vm, const struct 
 		__smolkvm_debug("KVM_SET_GUEST_DEBUG failed: %d\n", errno);
 
 	return ret;
+}
+
+#endif
+/* -- */
+
+/* mmio handling */
+#ifdef SMOLKVM_FOLD
+
+static inline bool __smolkvm_mmio_slot_used(const struct smolkvm_vm *vm, unsigned int slot)
+{
+	return vm->mmioregions[slot] != NULL;
+}
+
+static inline int __smolkvm_find_free_mmio_slot(const struct smolkvm_vm *vm)
+{
+	unsigned int i;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->mmioregions); i++)
+		if (!__smolkvm_mmio_slot_used(vm, i))
+			return (int) i;
+
+	return -1;
+}
+
+#define __smolkvm_foreach_mmio(_vm, __mmio) \
+	for (__mmio = &(_vm)->mmioregions[0]; \
+	     __mmio != &(_vm)->mmioregions[SMOLKVM_ARRAYSIZE((_vm)->mmioregions)]; \
+	     __mmio++) \
+		if (*__mmio)
+
+static inline int __smolkvm_plugin_mmio(struct smolkvm_vm *vm, struct smolkvm_mmio *mmio)
+{
+	int slot = __smolkvm_find_free_mmio_slot(vm);
+
+	if (slot < 0) {
+		printf("no free mmio slots, cannot plug in \'%s\'\n", mmio->name);
+		return -1;
+	}
+
+	__smolkvm_debug("Plugging in MMIO device \'%s\' to slot %d\n",
+			mmio->name, slot);
+
+	vm->mmioregions[slot] = mmio;
+	vm->mmio_plugged_in++;
+
+	return 0;
+}
+
+static inline int __smolkvm_find_mmio_device(const struct smolkvm_vm *vm, uint64_t addr)
+{
+	unsigned int i;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->mmioregions); i++) {
+		struct smolkvm_mmio *mmio = vm->mmioregions[i];
+
+		if (!mmio)
+			continue;
+
+		if ((addr >= mmio->phys) && (addr < (mmio->phys + mmio->len)))
+			return (int) i;
+	}
+
+	return -1;
+}
+
+static inline int __smolkvm_handle_mmio(struct smolkvm_vm *vm)
+{
+	struct kvm_run *run = vm->vcpu_run;
+	uint64_t mmio_addr = run->mmio.phys_addr;
+	int mmio_device = __smolkvm_find_mmio_device(vm, mmio_addr);
+	bool is_write = run->mmio.is_write;
+	uint64_t len = run->mmio.len;
+	struct smolkvm_mmio *mmio;
+	uint64_t offset;
+
+	__smolkvm_debug("mmio %s to 0x%lx, len %lu\n",
+			is_write ? "write" : "read", mmio_addr, len);
+	if (is_write)
+	    __smolkvm_debug("0x%02x, 0x%02x, 0x%02x, 0x%02x\n"
+			    "0x%02x, 0x%02x, 0x%02x, 0x%02x\n",
+			    run->mmio.data[0], run->mmio.data[1], run->mmio.data[2], run->mmio.data[3],
+			    run->mmio.data[4], run->mmio.data[5], run->mmio.data[6], run->mmio.data[7]);
+
+	if (mmio_device < 0) {
+		printf("unhandled MMIO access to 0x%lx, stopping the VM\n", mmio_addr);
+
+		return -SMOLKVM_ERR_MMIO_NO_DEVICE;
+	}
+
+	mmio = vm->mmioregions[mmio_device];
+	__smolkvm_debug("mmio access to device \'%s\'\n", mmio->name);
+
+	offset = mmio_addr - mmio->phys;
+
+	// value is in run->mmio.data[8]
+
+	if (is_write) {
+		uint64_t val = 0;
+		int i;
+
+		/* Pack the data into a u64, I might regret this later :/ */
+		for (i = 0; i < (int) len && i < sizeof(run->mmio.data); i++)
+		    val |= ((uint64_t) run->mmio.data[i]) << (i * 8);
+
+		mmio->write(vm, mmio, offset, len, val);
+	}
+	else {
+		uint64_t val = 0;
+		int i;
+
+		val = mmio->read(vm, mmio, offset, len);
+		for (i = 0; i < (int) len && i < sizeof(run->mmio.data); i++)
+			run->mmio.data[i] = (val >> (i * 8)) & 0xff;
+	}
+
+	return 0;
+}
+
+/*
+ * Port IO. Nothing is emulated: every port reads as 0xFF / swallows
+ * writes, which is what a PC with nothing on the bus looks like.
+ */
+static inline int __smolkvm_handle_io(struct smolkvm_vm *vm)
+{
+	struct kvm_run *run = vm->vcpu_run;
+	bool is_in = run->io.direction == KVM_EXIT_IO_IN;
+	uint8_t *data = (uint8_t *) run + run->io.data_offset;
+	uint32_t total = (uint32_t) run->io.size * run->io.count;
+
+	__smolkvm_debug("io %s port 0x%x, size %u, count %u\n",
+			is_in ? "in" : "out", run->io.port, run->io.size, run->io.count);
+
+	if (is_in)
+		memset(data, 0xFF, total);
+
+	return 0;
 }
 
 #endif
@@ -797,5 +980,174 @@ void smolkvm_destroy_vm(struct smolkvm_vm *vm)
 #endif
 /* -- */
 
+static const char *smolkvm_exit_reasons[] = {
+	[KVM_EXIT_UNKNOWN] = "UNKNOWN",
+	[KVM_EXIT_EXCEPTION] = "EXCEPTION",
+	[KVM_EXIT_IO] = "IO",
+	[KVM_EXIT_HYPERCALL] = "HYPERCALL",
+	[KVM_EXIT_DEBUG] = "DEBUG",
+	[KVM_EXIT_HLT] = "HLT",
+	[KVM_EXIT_MMIO] = "MMIO",
+	[KVM_EXIT_IRQ_WINDOW_OPEN] = "IRQ_WINDOW_OPEN",
+	[KVM_EXIT_SHUTDOWN] = "SHUTDOWN",
+	[KVM_EXIT_FAIL_ENTRY] = "FAIL_ENTRY",
+	[KVM_EXIT_INTR] = "INTR",
+	[KVM_EXIT_SET_TPR] = "SET_TPR",
+	[KVM_EXIT_TPR_ACCESS] = "TPR_ACCESS",
+	[KVM_EXIT_NMI] = "NMI",
+	[KVM_EXIT_INTERNAL_ERROR] = "INTERNAL_ERROR",
+	[KVM_EXIT_WATCHDOG] = "WATCHDOG",
+	[KVM_EXIT_SYSTEM_EVENT] = "SYSTEM_EVENT",
+	[KVM_EXIT_IOAPIC_EOI] = "IOAPIC_EOI",
+};
+
+/* KVM grows exit reasons; the table above is sparse and ends early */
+static inline const char *__smolkvm_exit_reason_str(uint32_t exit_reason)
+{
+	if (exit_reason >= SMOLKVM_ARRAYSIZE(smolkvm_exit_reasons) ||
+	    !smolkvm_exit_reasons[exit_reason])
+		return "??";
+
+	return smolkvm_exit_reasons[exit_reason];
+}
+
+int smolkvm_run(struct smolkvm_vm *vm)
+{
+	int ret;
+	uint32_t exit_reason;
+
+	ret = __smolkvm_run(vm);
+	if (ret) {
+		if (ret == 1) {
+			vm->was_interrupted = true;
+			return 0;
+		}
+
+		return ret;
+	}
+
+	exit_reason = vm->vcpu_run->exit_reason;
+
+	__smolkvm_debug("exit: %s\n", __smolkvm_exit_reason_str(exit_reason));
+	__smolkvm_debug_dump_regs(&vm->vcpu_run->s.regs.regs);
+	__smolkvm_debug_dump_sregs(&vm->vcpu_run->s.regs.sregs);
+
+	switch (vm->vcpu_run->exit_reason) {
+	case KVM_EXIT_FAIL_ENTRY:
+		printf("VM entry failed! Reason: 0x%llx\n",
+			vm->vcpu_run->fail_entry.hardware_entry_failure_reason);
+		/* This is bad, abort abort! */
+		return -1;
+	case KVM_EXIT_HLT:
+		break;
+	case KVM_EXIT_SHUTDOWN:
+		return -1;
+	case KVM_EXIT_MMIO:
+		ret = __smolkvm_handle_mmio(vm);
+		if (ret)
+			return ret;
+		break;
+	case KVM_EXIT_IO:
+		ret = __smolkvm_handle_io(vm);
+		if (ret)
+			return ret;
+		break;
+	case KVM_EXIT_DEBUG:
+		/* GDB single-step / breakpoint: let the default loop handle it */
+		break;
+	default:
+		/*
+		 * Anything we don't explicitly recognise (internal errors, a
+		 * fault that couldn't be delivered, stray IO, ...) stops the VM
+		 * rather than silently re-entering KVM_RUN and livelocking.
+		 */
+		printf("unhandled exit reason %u, stopping the VM\n", exit_reason);
+		return -SMOLKVM_ERR_UNHANDLED_EXIT;
+	}
+
+	return 0;
+}
+
+static bool __smolkvm_stopped(const struct smolkvm_vm *vm)
+{
+	return false;
+}
+
+static void __smolkvm_stop(struct smolkvm_vm *vm)
+{
+}
+
+static void __smolkvm_default_loop_pre_run(struct smolkvm_vm *vm)
+{
+	struct smolkvm_mmio **mmio;
+
+	__smolkvm_foreach_mmio(vm, mmio) {
+		if ((*mmio)->pre_run)
+			(*mmio)->pre_run(vm, *mmio);
+	}
+
+}
+
+static bool __smolkvm_is_single_stepping(struct smolkvm_vm *vm)
+{
+	return false;
+}
+
+static int __smolkvm_default_loop_configure_run(struct smolkvm_vm *vm)
+{
+	return 0;
+}
+
+static void __smolkvm_default_loop_post_run(struct smolkvm_vm *vm)
+{
+	struct smolkvm_mmio **mmio;
+
+	__smolkvm_foreach_mmio(vm, mmio) {
+		if ((*mmio)->post_run)
+			(*mmio)->post_run(vm, *mmio);
+	}
+
+}
+
+/* Default loop for running the VM */
+#ifdef SMOLKVM_FOLD
+
+int smolkvm_default_loop(struct smolkvm_vm *vm)
+{
+	int ret;
+
+	while (true) {
+		/* Any pre-run work, like handling for GDB packets */
+		__smolkvm_default_loop_pre_run(vm);
+
+		/* Check if we should actually do the run or not */
+		if (!__smolkvm_stopped(vm)) {
+			/* Setup things like single step */
+			ret = __smolkvm_default_loop_configure_run(vm);
+			if (ret)
+				return ret;
+
+			/* Do the actual kvm run bit */
+			ret = smolkvm_run(vm);
+			if (ret)
+				return ret;
+
+			/* CHECKME set the stopped flag, what we actually should do here depends on the exit reason */
+			if (__smolkvm_is_single_stepping(vm))
+				__smolkvm_stop(vm);
+		}
+
+		/* Any post-run work, like handling GDB packets */
+		__smolkvm_default_loop_post_run(vm);
+
+		/* Clear any flags from the last run */
+		vm->was_interrupted = false;
+	}
+
+	return ret;
+}
+
+#endif
+/* -- */
 
 #endif /* _SMOLKVM_H */
