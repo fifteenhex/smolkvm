@@ -136,5 +136,105 @@ static inline void __smolkvm_debug_dump_sregs(struct kvm_sregs *sregs)
 #endif
 /* -- */
 
+/* State structures */
+#ifdef SMOLKVM_FOLD
+
+
+struct smolkvm_vm {
+	int vcpu_fd;
+	int kvm_fd;
+	int vm_fd;
+	struct kvm_run *vcpu_run;
+	size_t vcpu_run_sz;
+
+	struct kvm_userspace_memory_region memregions[SMOLKVM_MEMREGIONS_NUM];
+	/* Running count only; per-slot occupancy (memory_size != 0) is authoritative */
+	unsigned int memory_region_plugged_in;
+
+
+};
+
+#endif
+/* -- */
+
+/* Slot management: per-slot occupancy is the source of truth */
+#ifdef SMOLKVM_FOLD
+
+static inline bool __smolkvm_memregion_slot_used(const struct smolkvm_vm *vm, unsigned int slot)
+{
+	return vm->memregions[slot].memory_size != 0;
+}
+
+/* First free RAM slot, or -1 if the table is full */
+static inline int __smolkvm_find_free_memregion_slot(const struct smolkvm_vm *vm)
+{
+	unsigned int i;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->memregions); i++)
+		if (!__smolkvm_memregion_slot_used(vm, i))
+			return (int) i;
+
+	return -1;
+}
+
+#endif
+/* -- */
+
+/* KVM ioctl wrappers */
+#ifdef SMOLKVM_FOLD
+
+/*  -1 - Error
+ *   0 - ioctl returned
+ *   1 - interrupted;
+ */
+static inline int __smolkvm_run(const struct smolkvm_vm *vm)
+{
+	int ret;
+
+	ret = ioctl(vm->vcpu_fd, KVM_RUN, 0);
+	if (ret) {
+		if (errno == EINTR) {
+			__smolkvm_debug("KVM_RUN was interrupted\n");
+			return 1;
+		}
+		__smolkvm_debug("KVM_RUN failed: %d, errno: %d\n", ret, errno);
+		return -1;
+	}
+
+	return ret;
+}
+
+static inline int __smolkvm_get_regs(const struct smolkvm_vm *vm, struct kvm_regs *regs)
+{
+	return ioctl(vm->vcpu_fd, KVM_GET_REGS, regs);
+}
+
+static inline int __smolkvm_set_regs(struct smolkvm_vm *vm, struct kvm_regs *regs)
+{
+	return ioctl(vm->vcpu_fd, KVM_SET_REGS, regs);
+}
+
+static inline int __smolkvm_get_sregs(const struct smolkvm_vm *vm, struct kvm_sregs *sregs)
+{
+	return ioctl(vm->vcpu_fd, KVM_GET_SREGS, sregs);
+}
+
+static inline int __smolkvm_set_sregs(const struct smolkvm_vm *vm, struct kvm_sregs *sregs)
+{
+	return ioctl(vm->vcpu_fd, KVM_SET_SREGS, sregs);
+}
+
+static inline int __smolkvm_set_guest_debug(struct smolkvm_vm *vm, const struct kvm_guest_debug *guest_debug)
+{
+	int ret = ioctl(vm->vcpu_fd, KVM_SET_GUEST_DEBUG, guest_debug);
+	if (ret)
+		__smolkvm_debug("KVM_SET_GUEST_DEBUG failed: %d\n", errno);
+
+	return ret;
+}
+
+#endif
+/* -- */
+
 
 #endif /* _SMOLKVM_H */
