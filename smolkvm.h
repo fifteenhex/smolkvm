@@ -236,5 +236,223 @@ static inline int __smolkvm_set_guest_debug(struct smolkvm_vm *vm, const struct 
 #endif
 /* -- */
 
+/* Read/Write into guest memory */
+#ifdef SMOLKVM_FOLD
+
+#define SMOLKVM_OFFSET_IN_MEMREGION(__memregion, __physaddr) \
+	(__physaddr - __memregion->guest_phys_addr)
+
+#define SMOLKVM_MEMREGION_PTR(_memregion, _physaddr) \
+	((void *) _memregion->userspace_addr + SMOLKVM_OFFSET_IN_MEMREGION(_memregion, _physaddr))
+
+static inline int __smolkvm_find_memregion(const struct smolkvm_vm *vm, uint64_t addr)
+{
+	int i;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(vm->memregions); i++)
+	{
+		const struct kvm_userspace_memory_region *memory_region = &vm->memregions[i];
+		uint64_t phys_start = memory_region->guest_phys_addr;
+		uint64_t phys_end = phys_start + memory_region->memory_size;
+
+		/* Skip empty / unplugged slots */
+		if (memory_region->memory_size == 0)
+			continue;
+
+		if ((addr >= phys_start) && (addr < phys_end)) {
+#ifdef SMOLKVM_DEBUG
+			printf("0x%llx is region %d\n", (unsigned long long) addr, i);
+#endif
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+static inline int __smolkvm_memory_check_bounds(uint64_t addr, uint64_t len, const struct kvm_userspace_memory_region *memory_region)
+{
+	if (len > (memory_region->guest_phys_addr + memory_region->memory_size) - addr)
+		return -1;
+
+	return 0;
+}
+
+static inline int __smolkvm_memory_read(const struct smolkvm_vm *vm, uint64_t addr, uint64_t len, void *dst)
+{
+	const struct kvm_userspace_memory_region *memory_region;
+	int region;
+	int ret;
+
+	region = __smolkvm_find_memregion(vm, addr);
+	if (region < 0)
+		return -1;
+
+	memory_region = &vm->memregions[region];
+
+	ret = __smolkvm_memory_check_bounds(addr, len, memory_region);
+	if (ret)
+		return ret;
+
+	memcpy(dst, SMOLKVM_MEMREGION_PTR(memory_region, addr), len);
+
+	return 0;
+}
+
+static inline int __smolkvm_memory_write(const struct smolkvm_vm *vm, uint64_t addr, uint64_t len, const void *src)
+{
+	const struct kvm_userspace_memory_region *memory_region;
+	int region;
+	int ret;
+
+	region = __smolkvm_find_memregion(vm, addr);
+	if (region < 0)
+		return -1;
+
+	memory_region = &vm->memregions[region];
+
+	ret = __smolkvm_memory_check_bounds(addr, len, memory_region);
+	if (ret)
+		return ret;
+
+	memcpy(SMOLKVM_MEMREGION_PTR(memory_region, addr), src, len);
+
+	return 0;
+}
+
+static inline int __smolkvm_memory_set(const struct smolkvm_vm *vm, uint64_t addr, uint64_t len, int byte)
+{
+	const struct kvm_userspace_memory_region *memory_region;
+	int region;
+	int ret;
+
+	region = __smolkvm_find_memregion(vm, addr);
+	if (region < 0)
+		return -1;
+
+	memory_region = &vm->memregions[region];
+
+	ret = __smolkvm_memory_check_bounds(addr, len, memory_region);
+	if (ret)
+		return ret;
+
+	memset(SMOLKVM_MEMREGION_PTR(memory_region, addr), byte, len);
+
+	return 0;
+}
+
+int smolkvm_guest_read(struct smolkvm_vm *vm, uint64_t gpa, uint64_t len, void *dst)
+{
+	return __smolkvm_memory_read(vm, gpa, len, dst);
+}
+
+int smolkvm_guest_write(struct smolkvm_vm *vm, uint64_t gpa, uint64_t len, const void *src)
+{
+	return __smolkvm_memory_write(vm, gpa, len, src);
+}
+
+#endif
+/* -- */
+
+/* Plugging memory into the guest, TODO removing */
+#ifdef SMOLKVM_FOLD
+
+static inline int __smolkvm_setmemory(struct smolkvm_vm *vm, int which)
+{
+	struct kvm_userspace_memory_region *memory_region;
+	int ret;
+
+	memory_region = &vm->memregions[which];
+
+	ret = ioctl(vm->vm_fd, KVM_SET_USER_MEMORY_REGION, memory_region);
+	if (ret)
+		printf("%d\n", errno);
+
+	return ret;
+}
+
+#endif
+/* -- */
+
+/* Adding RAM to a running guest */
+#ifdef SMOLKVM_FOLD
+
+/*
+ * Allocate `size` bytes of host memory and plug it into the guest at guest
+ * physical address `gpa` as a fresh KVM memslot. This is the low level "add
+ * memory" primitive: it makes the GPA range *backable*, but the guest still
+ * needs page tables covering it before it can actually touch the range.
+ */
+int smolkvm_map_memory(struct smolkvm_vm *vm, uint64_t gpa, uint64_t size)
+{
+	struct kvm_userspace_memory_region *memory_region;
+	unsigned int slot;
+	int free_slot;
+	void *memory;
+	int ret;
+
+	free_slot = __smolkvm_find_free_memregion_slot(vm);
+	if (free_slot < 0) {
+		printf("no free memory slots, cannot map 0x%llx bytes at 0x%llx\n",
+			   (unsigned long long) size, (unsigned long long) gpa);
+		return -1;
+	}
+	slot = (unsigned int) free_slot;
+
+	/* KVM requires page alignment, and the guest can pass anything here */
+	if (gpa & (SMOLKVM_SZ_4K - 1)) {
+		printf("gpa 0x%llx is not page aligned\n",
+			   (unsigned long long) gpa);
+		return -1;
+	}
+
+	/* KVM requires the size to be a non-zero multiple of the page size */
+	if (size == 0 || (size & (SMOLKVM_SZ_4K - 1))) {
+		printf("size 0x%llx is not a non-zero multiple of page size\n",
+			   (unsigned long long) size);
+		return -1;
+	}
+
+	memory = mmap(NULL, size, PROT_READ | PROT_WRITE,
+				  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (memory == MAP_FAILED) {
+		printf("failed to mmap 0x%llx bytes of guest memory\n",
+			   (unsigned long long) size);
+		return -1;
+	}
+
+	memset(memory, 0, size);
+
+	memory_region = &vm->memregions[slot];
+
+	memory_region->slot = slot;
+	memory_region->guest_phys_addr = gpa;
+	memory_region->memory_size = size;
+	memory_region->userspace_addr = (uint64_t) memory;
+
+	ret = __smolkvm_setmemory(vm, slot);
+	if (ret) {
+		printf("KVM_SET_USER_MEMORY_REGION failed for slot %u\n", slot);
+		/*
+		 * Clear the slot again: leaving it populated would make the
+		 * guest-memory helpers copy through the mapping we are about
+		 * to tear down.
+		 */
+		memset(memory_region, 0, sizeof(*memory_region));
+		munmap(memory, size);
+		return -1;
+	}
+
+	vm->memory_region_plugged_in++;
+
+	__smolkvm_debug("mapped 0x%llx bytes at gpa 0x%016llx (slot %u, host %p)\n",
+					(unsigned long long) size, (unsigned long long) gpa, slot, memory);
+
+	return 0;
+}
+
+#endif
+/* -- */
+
 
 #endif /* _SMOLKVM_H */
