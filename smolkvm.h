@@ -95,6 +95,8 @@
 #define SMOLKVM_ERR_CREATE_SETSREGS 109
 #define SMOLKVM_ERR_CREATE_GETREGS  110
 #define SMOLKVM_ERR_CREATE_SETREGS  111
+#define SMOLKVM_ERR_GET_CPUID       114
+#define SMOLKVM_ERR_SET_CPUID       115
 
 #endif
 /* -- */
@@ -649,6 +651,147 @@ int smolkvm_map_memory(struct smolkvm_vm *vm, uint64_t gpa, uint64_t size)
 					(unsigned long long) size, (unsigned long long) gpa, slot, memory);
 
 	return 0;
+}
+
+#endif
+/* -- */
+
+/* VM creation and teardown */
+#ifdef SMOLKVM_FOLD
+
+/*
+ * Tell the guest what the CPU can do. KVM hands a vCPU a near-empty CPUID by
+ * default; we pass through whatever the host KVM says it can support. This is
+ * harmless for the bare-metal IPL (which never consults CPUID) but mandatory
+ * for an OS like Linux that feature-probes heavily.
+ */
+#define SMOLKVM_CPUID_MAX_ENTRIES 256
+
+static int __smolkvm_setup_cpuid(struct smolkvm_vm *vm)
+{
+	struct kvm_cpuid2 *cpuid;
+	int ret;
+
+	cpuid = calloc(1, sizeof(*cpuid) +
+		       SMOLKVM_CPUID_MAX_ENTRIES * sizeof(struct kvm_cpuid_entry2));
+	if (!cpuid)
+		return -SMOLKVM_ERR_ALLOCMEMORY;
+
+	cpuid->nent = SMOLKVM_CPUID_MAX_ENTRIES;
+
+	ret = ioctl(vm->kvm_fd, KVM_GET_SUPPORTED_CPUID, cpuid);
+	if (ret < 0) {
+		__smolkvm_debug("KVM_GET_SUPPORTED_CPUID failed: %d\n", ret);
+		free(cpuid);
+		return -SMOLKVM_ERR_GET_CPUID;
+	}
+
+	ret = ioctl(vm->vcpu_fd, KVM_SET_CPUID2, cpuid);
+	if (ret < 0) {
+		__smolkvm_debug("KVM_SET_CPUID2 failed: %d\n", ret);
+		free(cpuid);
+		return -SMOLKVM_ERR_SET_CPUID;
+	}
+
+	free(cpuid);
+	return 0;
+}
+
+int smolkvm_create_vm(struct smolkvm_vm *vm)
+{
+	struct kvm_userspace_memory_region *memory_region = &vm->memregions[0];
+	int kvm_fd, vm_fd, vcpu_fd;
+	struct kvm_run *vcpu_run;
+	int kvm_run_sz;
+	void *memory;
+	int ret;
+
+	kvm_fd = open("/dev/kvm", O_RDWR);
+	if (kvm_fd < 0)
+		return -SMOLKVM_ERR_OPENKVM;
+
+	vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0);
+	if (vm_fd < 0)
+		return -SMOLKVM_ERR_CREATEVM;
+
+	vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0);
+	if (vcpu_fd < 0)
+		return -SMOLKVM_ERR_CREATEVCPU;
+
+	kvm_run_sz= ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
+	if (kvm_run_sz <= 0)
+		return -SMOLKVM_ERR_VCPUMMAPSIZE;
+
+	vcpu_run = mmap(NULL, kvm_run_sz, PROT_READ | PROT_WRITE,
+			MAP_SHARED, vcpu_fd, 0);
+	if (vcpu_run == MAP_FAILED)
+		return -SMOLKVM_ERR_VCPUMMAP;
+
+	memory = mmap(NULL, SMOLKVM_BASEMEMORY_SZ, PROT_READ | PROT_WRITE,
+		       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (memory == MAP_FAILED)
+		return -SMOLKVM_ERR_ALLOCMEMORY;
+
+	memset(memory, 0, SMOLKVM_BASEMEMORY_SZ);
+
+	__smolkvm_debug("Memory from phys 0x%016llx -> 0x%016llx\n",
+	       SMOLKVM_BASEMEMORY_PHYS_START, SMOLKVM_BASEMEMORY_PHYS_END);
+
+	vm->kvm_fd = kvm_fd;
+	vm->vm_fd = vm_fd;
+	vm->vcpu_fd = vcpu_fd;
+	vm->vcpu_run  = vcpu_run;
+	vm->vcpu_run_sz = kvm_run_sz;
+
+	/* Sync the registers each run */
+	vm->vcpu_run->kvm_valid_regs = KVM_SYNC_X86_REGS | KVM_SYNC_X86_SREGS;
+
+	/* Fill in the initial memory region */
+	memory_region->slot = 0;
+	memory_region->guest_phys_addr = SMOLKVM_BASEMEMORY_PHYS_START;
+	memory_region->memory_size = SMOLKVM_BASEMEMORY_SZ;
+	memory_region->userspace_addr = (uint64_t)memory;
+
+	/* Plug in the initial memory */
+	ret = __smolkvm_setmemory(vm, 0);
+	if (ret)
+		return -SMOLKVM_ERR_SETMEMORYREGION;
+
+	/* We now have one RAM region plugged in (slot 0) */
+	vm->memory_region_plugged_in = 1;
+
+	/* Low memory, so "BIOS area" pokes from a stock OS hit RAM */
+	ret = smolkvm_map_memory(vm, SMOLKVM_LOWMEMORY_PHYS_START,
+				 SMOLKVM_LOWMEMORY_SZ);
+	if (ret)
+		return -SMOLKVM_ERR_SETMEMORYREGION;
+
+	/* Create the initial page tables */
+	__smolkvm_create_initial_pagetables(vm);
+
+	/* Advertise CPU features to the guest before the first run */
+	ret = __smolkvm_setup_cpuid(vm);
+	if (ret)
+		return ret;
+
+	/* Looks like KVM is ready to go. Setup the CPU */
+	ret = __smolkvm_switch_cpu_into_longmode(vm);
+	if (ret)
+		return ret;
+
+	ret = __smolkvm_set_rip(vm);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+void smolkvm_destroy_vm(struct smolkvm_vm *vm)
+{
+	munmap(vm->vcpu_run, vm->vcpu_run_sz);
+	close(vm->vcpu_fd);
+	close(vm->vm_fd);
+	close(vm->kvm_fd);
 }
 
 #endif
