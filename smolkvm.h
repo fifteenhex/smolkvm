@@ -54,6 +54,8 @@
  *   SMOLKVM_DEBUG                -- Be very noisy about what is going on to help with working out what is broken.
  *   SMOLKVM_MEMREGIONS_NUM       -- How many memory regions are possible, see default below.
  *   SMOLKVM_MMIOREGIONS_NUM      -- How many mmio, device, regions are possible, see default below.
+ *   SMOLKVM_WANT_GDB_STUB        -- Include a GDB remote stub for debugging.
+ *   SMOLKVM_WANT_GDB_STUB_DEBUG  -- Add noisy debug messages for the stub.
  *   SMOLKVM_WANT_SIMPLE          -- Machine with the simple polled irqchip + timer (default).
  *   SMOLKVM_WANT_APIC            -- Machine with the in-kernel APIC + PIT (boots stock OSes).
  */
@@ -259,6 +261,16 @@ struct smolkvm_mmio {
 	void *priv;
 };
 
+#ifdef SMOLKVM_WANT_GDB_STUB
+struct smolkvm_gdb_stub {
+	int listen_socket;
+	int conn_socket;
+
+	/* Are we waiting for GDB to tell us to run ? */
+	bool stopped;
+	bool single_stepping;
+};
+#endif
 
 struct smolkvm_vm {
 	int vcpu_fd;
@@ -276,6 +288,9 @@ struct smolkvm_vm {
 	/* Running count only; per-slot occupancy (pointer != NULL) is authoritative */
 	unsigned int mmio_plugged_in;
 
+#ifdef SMOLKVM_WANT_GDB_STUB
+	struct smolkvm_gdb_stub gdb_stub;
+#endif
 
 	bool was_interrupted;
 };
@@ -491,6 +506,183 @@ err_close_sock:
 
 #endif
 /* -- */
+
+/* GDB stuff 1 */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_GDB_STUB
+/* The raw "type" characters that are at the start of the GDB packet */
+#define SMOLKVM_GDB_STUB_PKTTYPE_EXTENDED	'!'
+#define SMOLKVM_GDB_STUB_PKTTYPE_STOP_REASON	'?'
+#define SMOLKVM_GDB_STUB_PKTTYPE_CONTINUE	'c'
+#define SMOLKVM_GDB_STUB_PKTTYPE_READ_REGS	'g'
+#define SMOLKVM_GDB_STUB_PKTTYPE_H		'H'
+#define SMOLKVM_GDB_STUB_PKTTYPE_READ_MEM	'm'
+#define SMOLKVM_GDB_STUB_PKTTYPE_QUERY		'q'
+#define SMOLKVM_GDB_STUB_PKTTYPE_STEP		's'
+#define SMOLKVM_GDB_STUB_PKTTYPE_V		'v'
+
+#define SMOLKVM_GDB_TARGET_XML "<target version=\"1.0\"><architecture>i386:x86-64</architecture></target>"
+
+static const unsigned char __smolkvm_gdb_stub_ack = '+';
+static const unsigned char __smolkvm_gdb_stub_nak = '-';
+static const unsigned char __smolkvm_gdb_stub_pktstart = '$';
+static const unsigned char __smolkvm_gdb_stub_pktend = '#';
+
+static const unsigned char __smolkvm_gdb_pkt_query_attached[] = "Attached";
+static const unsigned char __smolkvm_gdb_pkt_query_support[] = "Supported:";
+static const unsigned char __smolkvm_gdb_pkt_query_xfer[] = "Xfer:features:read:";
+static const unsigned char __smolkvm_gdb_pkt_v_cont[] = "Cont?";
+static const unsigned char __smolkvm_gdb_pkt_v_mustreplyempty[] = "MustReplyEmpty";
+
+enum smolkvm_gdb_stub_type {
+	SMOLKVM_GDB_STUB_UNKNOWN,
+	SMOLKVM_GDB_STUB_STOP_REASON,
+	SMOLKVM_GDB_STUB_READ_REGS,
+	SMOLKVM_GDB_STUB_CONTINUE,
+	SMOLKVM_GDB_STUB_STEP,
+	SMOLKVM_GDB_STUB_QUERY,
+	SMOLKVM_GDB_STUB_READ_MEM,
+	SMOLKVM_GDB_STUB_H,
+	SMOLKVM_GDB_STUB_V,
+};
+
+enum smolkvm_gdb_stub_query_subtype {
+	SMOLKVM_GDB_STUB_QUERY_UNKNOWN,
+	SMOLKVM_GDB_STUB_QUERY_ATTACHED,
+	SMOLKVM_GDB_STUB_QUERY_SUPPORTED,
+	SMOLKVM_GDB_STUB_QUERY_XFER_FEATURES,
+};
+
+enum smolkvm_gdb_stub_v_subtype {
+	SMOLKVM_GDB_STUB_V_CONT,
+	SMOLKVM_GDB_STUB_V_MUSTREPLYEMPTY,
+	SMOLKVM_GDB_STUB_V_UNKNOWN,
+};
+
+struct smolkvm_gdb_stub_pkt_query {
+	enum smolkvm_gdb_stub_query_subtype subtype;
+};
+
+struct smolkvm_gdb_stub_pkt_h {
+	int subtype;
+};
+
+struct smolkvm_gdb_stub_pkt_v {
+	enum smolkvm_gdb_stub_v_subtype subtype;
+};
+
+struct smolkvm_gdb_stub_pkt_read_mem {
+	uint64_t addr;
+	uint64_t len;
+};
+
+struct smolkvm_gdb_stub_pkt {
+	enum smolkvm_gdb_stub_type type;
+	union {
+		struct smolkvm_gdb_stub_pkt_query query;
+		struct smolkvm_gdb_stub_pkt_h h;
+		struct smolkvm_gdb_stub_pkt_v v;
+		struct smolkvm_gdb_stub_pkt_read_mem read_mem;
+	};
+};
+
+static inline uint8_t __smolkvm_gdb_stub_checksum(const char *data, unsigned int len)
+{
+	unsigned long long chksum = 0;
+	int i;
+
+	for (i = 0; i < len; i++)
+		chksum += data[i];
+	chksum %= 256;
+
+	return chksum;
+}
+
+static inline bool __smolkvm_gdb_stub_pkt_checksum(const char* pkt, unsigned int pktlen, const char* chksum)
+{
+	unsigned long long from_packet;
+
+	from_packet = strtoull(chksum, NULL, 16);
+
+	return __smolkvm_gdb_stub_checksum(pkt, pktlen) == from_packet;
+}
+
+static inline void __smolkvm_gdb_split_value_comma_value(const char* str, unsigned int len,
+							uint64_t *left, uint64_t *right)
+{
+	unsigned long long l, r;
+
+	// TODO make this safe
+	l = strtoull(str, NULL, 16);
+	while (*str && *str != ',')
+		str++;
+	if (*str == ',')
+		str++;
+	r = strtoull(str, NULL, 16);
+
+	*left = l;
+	*right = r;
+}
+
+#define __smolkvm_gdb_stub_start_match(_token) \
+	(len >= (sizeof(_token) - 1) && \
+	 memcmp(raw, _token, sizeof(_token) - 1) == 0)
+
+static inline int __smolkvm_gdb_stub_pkt_unpack(const unsigned char *raw,
+	unsigned int len, struct smolkvm_gdb_stub_pkt *pkt)
+{
+	unsigned char type = *raw++;
+	len--;
+
+	switch(type) {
+	case SMOLKVM_GDB_STUB_PKTTYPE_CONTINUE:
+		pkt->type = SMOLKVM_GDB_STUB_CONTINUE;
+	break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_STEP:
+		pkt->type = SMOLKVM_GDB_STUB_STEP;
+	break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_STOP_REASON:
+		pkt->type = SMOLKVM_GDB_STUB_STOP_REASON;
+		break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_READ_REGS:
+		pkt->type = SMOLKVM_GDB_STUB_READ_REGS;
+	break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_READ_MEM:  // Add this
+		pkt->type = SMOLKVM_GDB_STUB_READ_MEM;
+		__smolkvm_gdb_split_value_comma_value(raw, len, &pkt->read_mem.addr, &pkt->read_mem.len);
+		break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_QUERY:
+		pkt->type = SMOLKVM_GDB_STUB_QUERY;
+		if (__smolkvm_gdb_stub_start_match(__smolkvm_gdb_pkt_query_attached))
+			pkt->query.subtype = SMOLKVM_GDB_STUB_QUERY_ATTACHED;
+		else if (__smolkvm_gdb_stub_start_match(__smolkvm_gdb_pkt_query_support))
+			pkt->query.subtype = SMOLKVM_GDB_STUB_QUERY_SUPPORTED;
+		else if (__smolkvm_gdb_stub_start_match(__smolkvm_gdb_pkt_query_xfer))
+			pkt->query.subtype = SMOLKVM_GDB_STUB_QUERY_XFER_FEATURES;
+		else
+			pkt->query.subtype = SMOLKVM_GDB_STUB_QUERY_UNKNOWN;
+		break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_H:
+		pkt->type = SMOLKVM_GDB_STUB_H;
+		break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_V:
+		pkt->type = SMOLKVM_GDB_STUB_V;
+		if (__smolkvm_gdb_stub_start_match(__smolkvm_gdb_pkt_v_cont))
+			pkt->query.subtype = SMOLKVM_GDB_STUB_V_CONT;
+		else if (__smolkvm_gdb_stub_start_match(__smolkvm_gdb_pkt_v_mustreplyempty))
+			pkt->query.subtype = SMOLKVM_GDB_STUB_V_MUSTREPLYEMPTY;
+		else
+			pkt->query.subtype = SMOLKVM_GDB_STUB_V_UNKNOWN;
+		break;
+	default:
+		pkt->type = SMOLKVM_GDB_STUB_UNKNOWN;
+		return -1;
+	}
+
+	return 0;
+}
+#endif /* SMOLKVM_WANT_GDB_STUB */
+#endif /* fold */
 
 /* mmio handling */
 #ifdef SMOLKVM_FOLD
@@ -1188,6 +1380,485 @@ int smolkvm_guest_write(struct smolkvm_vm *vm, uint64_t gpa, uint64_t len, const
 
 #endif
 /* -- */
+
+/* GDB stuff 2 */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_GDB_STUB
+static inline int __smolkvm_gdb_stub_start(struct smolkvm_vm *vm)
+{
+	struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+	int port = 1234;
+	int ret;
+
+	ret = __smolkvm_create_server_socket(port);
+	if (ret < 0)
+		return ret;
+
+	gdb_stub->listen_socket = ret;
+	gdb_stub->stopped = true;
+
+	return 0;
+}
+
+static inline int __smolkvm_gdb_stub_accept(struct smolkvm_vm *vm)
+{
+	int listen_socket = vm->gdb_stub.listen_socket;
+	struct sockaddr_in client_addr;
+	socklen_t addr_len = sizeof(client_addr);
+	int conn_socket;
+	int ret;
+
+	while (true) {
+		ret = accept4(listen_socket, (struct sockaddr *)&client_addr, &addr_len, O_NONBLOCK);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+
+			printf("accept failed: %d, errno %d\n", ret, errno);
+			return -errno;
+		}
+		break;
+	}
+
+	conn_socket = ret;
+	__smolkvm_make_socket_trigger_sigio(conn_socket);
+
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("accepted connection\n");
+#endif
+
+	vm->gdb_stub.conn_socket = conn_socket;
+
+	return 0;
+}
+
+static inline int __smolkvm_gdb_wait_for_data(const struct smolkvm_vm *vm)
+{
+	struct pollfd pfd = {
+		.fd = vm->gdb_stub.conn_socket,
+		.events = POLLIN,
+		.revents = 0,
+	};
+	int ret;
+
+	ret = poll(&pfd, 1, -1);
+	if (ret < 0)
+		return -1;
+	if (ret == 0)
+		return 0;
+
+	if (pfd.revents & POLLIN)
+		return 1;
+
+	return -1;
+}
+
+static inline int __smolkvm_gdb_stub_read_packet(struct smolkvm_vm *vm,
+						  struct smolkvm_gdb_stub_pkt *pkt)
+{
+	int conn_socket = vm->gdb_stub.conn_socket;
+	unsigned char buff[2049] = {0};
+	unsigned char chk[3] = { 0 };
+	/* Did we see the $ yet? */
+	bool packet_started = false;
+	unsigned int len = 0;
+	int ret;
+
+	while (len < (sizeof(buff) - 1)) {
+		unsigned char sym;
+
+		ret = read(conn_socket, &sym, 1);
+		if (ret == 0)
+			/* The debugger closed the connection */
+			return -1;
+		if (ret != 1)
+			break;
+
+		if (!packet_started) {
+			if (sym == __smolkvm_gdb_stub_pktstart)
+				packet_started = true;
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+			else
+				printf("packet not started, received something that wasn't start character: %c\n", sym);
+#endif
+
+			continue;
+		}
+
+		if (sym == __smolkvm_gdb_stub_pktend) {
+			unsigned int got = 0;
+
+			/*
+			 * The trailer is exactly two hex digits; reading any
+			 * more would steal bytes from a pipelined packet.
+			 * They might not have arrived yet (non-blocking
+			 * socket), so keep trying.
+			 */
+			while (got < 2) {
+				ret = read(conn_socket, chk + got, 2 - got);
+				if (ret == 0)
+					return -1;
+				if (ret > 0)
+					got += ret;
+				else if (errno != EAGAIN && errno != EINTR)
+					break;
+			}
+			break;
+		}
+
+		buff[len++] = sym;
+	}
+
+	if (!len)
+		return 0;
+
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("have %d bytes of packet data, raw data %s\n", len, buff);
+#endif
+
+	if (__smolkvm_gdb_stub_pkt_checksum(buff, len, chk)) {
+		__smolkvm_gdb_stub_pkt_unpack(buff, len, pkt);
+		ret = write(conn_socket, &__smolkvm_gdb_stub_ack, 1);
+		return 1;
+	}
+	else
+		ret = write(conn_socket, &__smolkvm_gdb_stub_nak, 1);
+
+	return 0;
+}
+
+#define __smolkvm_gdb_stub_write_const(_sock, _const) \
+	write(_sock, &_const, sizeof(_const))
+
+/*
+ * This is a workaround to the problem with nolibc's sprintf() not being able to
+ * do left padding yet. I guess it might be a bit quicker too?
+ */
+static inline unsigned char __smolkvm_gdb_stub_nibbletohex(uint8_t nibble)
+{
+	const unsigned char table[] = {'0', '1', '2', '3', '4', '5', '6', '7',
+				       '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+
+	return table[nibble];
+}
+
+static inline void __smolkvm_gdb_u8tohex(char *output, uint8_t value)
+{
+	*output++ = __smolkvm_gdb_stub_nibbletohex((value >> 4) & 0xf);
+	*output = __smolkvm_gdb_stub_nibbletohex(value & 0xf);
+}
+
+/* FIXME: change argument order? use the u8 function in the loop ? */
+static inline void __smolkvm_gdb_u64tohex(uint64_t value, char *output)
+{
+	int i;
+
+	for (i = 0; i < 64; i += 8) {
+		uint8_t byte = (value >> i) & 0xff;
+		__smolkvm_gdb_u8tohex(output, byte);
+		output += 2;
+	}
+}
+
+static inline void __smolkvm_gdb_u32tohex(uint32_t value, char *output)
+{
+	int i;
+
+	for (i = 0; i < 32; i += 8) {
+		uint8_t byte = (value >> i) & 0xff;
+		__smolkvm_gdb_u8tohex(output, byte);
+		output += 2;
+	}
+}
+
+static inline void __smolkvm_gdb_stub_send_packet(struct smolkvm_vm *vm,
+						  const char *data,
+						  unsigned int len)
+{
+	int conn_socket = vm->gdb_stub.conn_socket;
+	unsigned char chk[3] = { 0 };
+	unsigned char resp;
+	int ret;
+
+	__smolkvm_gdb_u8tohex(chk, __smolkvm_gdb_stub_checksum(data, len));
+
+	ret = __smolkvm_gdb_stub_write_const(conn_socket, __smolkvm_gdb_stub_pktstart);
+	if (ret != 1)
+		return;
+
+	ret = write(conn_socket, data, len);
+	if (ret != len){
+		printf("whelp\n");
+	}
+
+	ret = __smolkvm_gdb_stub_write_const(conn_socket, __smolkvm_gdb_stub_pktend);
+
+	ret = write(conn_socket, chk, sizeof(chk) - 1);
+
+
+	__smolkvm_gdb_wait_for_data(vm);
+	ret = read(conn_socket, &resp, 1);
+	if (ret != 1)
+		return;
+
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("response to sent packet: \'%c\'\n", resp);
+#endif
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_stop_reason(struct smolkvm_vm *vm)
+{
+	__smolkvm_gdb_stub_send_packet(vm, "S05", 3);
+	return 1;
+}
+
+#define __smolkvm_gdb_stub_encode_reg64(_head, _regval)	\
+	do {						\
+		__smolkvm_gdb_u64tohex(_regval, _head);	\
+		_head += 16;				\
+	} while(0)
+
+#define __smolkvm_gdb_stub_encode_reg32(_head, _regval)	\
+	do {						\
+		__smolkvm_gdb_u32tohex(_regval, _head);	\
+		_head += 8;				\
+	} while(0)
+
+static inline int __smolkvm_gdb_stub_process_packet_read_regs(struct smolkvm_vm *vm)
+{
+	struct kvm_regs regs = { 0 };
+	struct kvm_sregs sregs = { 0 };
+	unsigned char buf[(17 * 16) + (7 * 8)];
+	unsigned char *head = buf;
+	int ret, pos = 0;
+
+	ret = __smolkvm_get_regs(vm, &regs);
+	if (ret) {
+		printf("failed to read regs %d\n", errno);
+	}
+
+	ret = __smolkvm_get_sregs(vm, &sregs);
+	if (ret) {
+		printf("failed to read special regs %d\n", errno);
+		//return -1;
+	}
+
+	memset(buf, '0', sizeof(buf));
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rax);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rbx);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rcx);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rdx);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rsi);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rdi);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rbp);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rsp);
+
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r8);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r9);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r10);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r11);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r12);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r13);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r14);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r15);
+
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rip);
+
+	__smolkvm_gdb_stub_encode_reg32(head, regs.rflags);
+
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.cs.selector);
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.ss.selector);
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.ds.selector);
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.es.selector);
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.fs.selector);
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.gs.selector);
+
+	__smolkvm_gdb_stub_send_packet(vm, buf, sizeof(buf));
+	return 1;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_read_mem(struct smolkvm_vm *vm,
+							      struct smolkvm_gdb_stub_pkt *pkt)
+{
+	uint64_t addr = pkt->read_mem.addr;
+	uint64_t len = pkt->read_mem.len;
+	char hexbuff[256] = { 0 };
+	uint8_t buff[128];
+	unsigned int i;
+
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("read memory: addr=0x%llx len=%llu\n", (unsigned long long) addr, (unsigned long long) len);
+#endif
+
+	/*
+	 * The requested length is whatever the debugger asked for; a short
+	 * reply is fine (GDB re-requests the rest), overflowing the buffers
+	 * with a remote-controlled length is not.
+	 */
+	if (len > sizeof(buff))
+		len = sizeof(buff);
+
+	if (__smolkvm_memory_read(vm, addr, len, buff)) {
+		__smolkvm_gdb_stub_send_packet(vm, "E01", 3);
+		return 1;
+	}
+
+	for (i = 0; i < len; i++)
+		__smolkvm_gdb_u8tohex(&hexbuff[i * 2], buff[i]);
+
+	__smolkvm_gdb_stub_send_packet(vm, hexbuff, len * 2);
+
+	return 1;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_query(struct smolkvm_vm *vm,
+						  struct smolkvm_gdb_stub_pkt *pkt)
+{
+	struct smolkvm_gdb_stub_pkt_query *query = &pkt->query;
+
+	#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("processing query packet, subtype: %d\n", query->subtype);
+	#endif
+
+	switch (query->subtype) {
+	case SMOLKVM_GDB_STUB_QUERY_ATTACHED:
+		__smolkvm_gdb_stub_send_packet(vm, "1", 1);
+		return 1;
+	case SMOLKVM_GDB_STUB_QUERY_SUPPORTED:
+		const char pkt_string[] = "PacketSize=2048;qXfer:features:read+;arch=i386:x86-64";
+		__smolkvm_gdb_stub_send_packet(vm, pkt_string, strlen(pkt_string));
+		return 1;
+	case SMOLKVM_GDB_STUB_QUERY_XFER_FEATURES:
+		const char target_xml[] = "l" SMOLKVM_GDB_TARGET_XML;
+		__smolkvm_gdb_stub_send_packet(vm, target_xml, strlen(target_xml));
+		return 1;
+	}
+
+	return 0;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_h(struct smolkvm_vm *vm,
+						  struct smolkvm_gdb_stub_pkt *pkt)
+{
+	struct smolkvm_gdb_stub_pkt_h *h = &pkt->h;
+
+	#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("processing H packet, subtype: %d\n", h->subtype);
+	#endif
+
+	__smolkvm_gdb_stub_send_packet(vm, "OK", 2);
+	return 1;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_v(struct smolkvm_vm *vm,
+						  struct smolkvm_gdb_stub_pkt *pkt)
+{
+	struct smolkvm_gdb_stub_pkt_v *v = &pkt->v;
+
+	#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("processing v packet, subtype: %d\n", v->subtype);
+	#endif
+
+	switch (v->subtype) {
+	//case SMOLKVM_GDB_STUB_QUERY_SUPPORTED:
+	//	break;
+	case SMOLKVM_GDB_STUB_V_MUSTREPLYEMPTY:
+	default:
+		/* Don't do anything, let an empty packet get sent. */
+		break;
+	}
+	return 0;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_continue(struct smolkvm_vm *vm)
+{
+	struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	gdb_stub->stopped = false;
+	gdb_stub->single_stepping = false;
+
+	/*
+	 * No reply here: the target is now *running*. The stop reply goes out
+	 * when it actually stops (see __smolkvm_gdb_stub_stop()); answering
+	 * S05 straight away makes GDB believe the target halted again.
+	 */
+	return 1;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_step(struct smolkvm_vm *vm)
+{
+	struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	gdb_stub->stopped = false;
+	gdb_stub->single_stepping = true;
+
+	/* As with continue: the stop reply is sent after the step happens */
+	return 1;
+}
+
+static inline void __smolkvm_gdb_stub_process_packet(struct smolkvm_vm *vm,
+						  struct smolkvm_gdb_stub_pkt *pkt)
+{
+	/*
+	 * <0 means there was an error,
+	 *  0 means the packet wasn't handled
+	 *  1 means the packet was handled
+	 */
+	int ret;
+
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("processing packet, type: %d\n", pkt->type);
+#endif
+
+	switch(pkt->type) {
+	case SMOLKVM_GDB_STUB_STOP_REASON:
+		ret = __smolkvm_gdb_stub_process_packet_stop_reason(vm);
+		break;
+	case SMOLKVM_GDB_STUB_READ_REGS:
+		ret = __smolkvm_gdb_stub_process_packet_read_regs(vm);
+		break;
+	case SMOLKVM_GDB_STUB_READ_MEM:
+		ret = __smolkvm_gdb_stub_process_packet_read_mem(vm, pkt);
+		break;
+	case SMOLKVM_GDB_STUB_CONTINUE:
+		ret = __smolkvm_gdb_stub_process_packet_continue(vm);
+		break;
+	case SMOLKVM_GDB_STUB_STEP:
+		ret = __smolkvm_gdb_stub_process_packet_step(vm);
+		break;
+	case SMOLKVM_GDB_STUB_QUERY:
+		ret = __smolkvm_gdb_stub_process_packet_query(vm, pkt);
+		break;
+	case SMOLKVM_GDB_STUB_H:
+		ret = __smolkvm_gdb_stub_process_packet_h(vm, pkt);
+		break;
+	case SMOLKVM_GDB_STUB_V:
+		ret = __smolkvm_gdb_stub_process_packet_v(vm, pkt);
+		break;
+	default:
+		ret = 0;
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+		printf("unhandled packet type\n");
+#endif
+		break;
+	}
+
+	if (ret < 0) {
+		printf("error handling packet: %d\n", ret);
+		return;
+	}
+
+	if (ret == 0)
+		__smolkvm_gdb_stub_send_packet(vm, NULL, 0);
+}
+
+/* The target just stopped (e.g. a single step completed): tell the debugger */
+static inline void __smolkvm_gdb_stub_stop(struct smolkvm_vm *vm)
+{
+	__smolkvm_gdb_stub_send_packet(vm, "S05", 3);
+}
+#endif /* SMOLKVM_WANT_GDB_STUB */
+#endif /* fold */
 
 /* Early CPU init stuff, switch to longmode, initial guest page tables etc */
 #ifdef SMOLKVM_FOLD
@@ -2538,13 +3209,42 @@ int smolkvm_run(struct smolkvm_vm *vm)
 	return 0;
 }
 
+int smolkvm_single_step(struct smolkvm_vm *vm, bool on)
+{
+	const struct kvm_guest_debug single_step_on = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+	};
+	const struct kvm_guest_debug single_step_off = {
+		.control = 0,
+	};
+	int ret;
+
+	ret = __smolkvm_set_guest_debug(vm, (on ? &single_step_on : &single_step_off));
+	if (ret)
+		return -1;
+
+	return 0;
+}
+
 static bool __smolkvm_stopped(const struct smolkvm_vm *vm)
 {
+#ifdef SMOLKVM_WANT_GDB_STUB
+	const struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	return gdb_stub->stopped;
+#else
 	return false;
+#endif
 }
 
 static void __smolkvm_stop(struct smolkvm_vm *vm)
 {
+#ifdef SMOLKVM_WANT_GDB_STUB
+	struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	gdb_stub->stopped = true;
+	__smolkvm_gdb_stub_stop(vm);
+#endif
 }
 
 static void __smolkvm_default_loop_pre_run(struct smolkvm_vm *vm)
@@ -2563,16 +3263,43 @@ static void __smolkvm_default_loop_pre_run(struct smolkvm_vm *vm)
 			(*mmio)->pre_run(vm, *mmio);
 	}
 
+#ifdef SMOLKVM_WANT_GDB_STUB
+	struct smolkvm_gdb_stub_pkt pkt;
+
+	int pktret = __smolkvm_gdb_stub_read_packet(vm, &pkt);
+	if (pktret == 1)
+		__smolkvm_gdb_stub_process_packet(vm, &pkt);
+	else if (pktret < 0) {
+		/* The debugger went away: let the guest run free */
+		printf("GDB disconnected, resuming\n");
+		close(vm->gdb_stub.conn_socket);
+		vm->gdb_stub.conn_socket = -1;
+		vm->gdb_stub.stopped = false;
+		vm->gdb_stub.single_stepping = false;
+	}
+#endif
 }
 
 static bool __smolkvm_is_single_stepping(struct smolkvm_vm *vm)
 {
+#ifdef SMOLKVM_WANT_GDB_STUB
+	const struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	return gdb_stub->single_stepping;
+#else
 	return false;
+#endif
 }
 
 static int __smolkvm_default_loop_configure_run(struct smolkvm_vm *vm)
 {
+#ifdef SMOLKVM_WANT_GDB_STUB
+	const struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	return smolkvm_single_step(vm, __smolkvm_is_single_stepping(vm));
+#else
 	return 0;
+#endif
 }
 
 static void __smolkvm_default_loop_post_run(struct smolkvm_vm *vm)
@@ -2584,6 +3311,15 @@ static void __smolkvm_default_loop_post_run(struct smolkvm_vm *vm)
 			(*mmio)->post_run(vm, *mmio);
 	}
 
+#ifdef SMOLKVM_WANT_GDB_STUB
+	/*
+	 * Only block for the debugger while the target is stopped; while it
+	 * is running, packets are picked up opportunistically in pre_run on
+	 * the next exit (and SIGIO forces one).
+	 */
+	if (vm->gdb_stub.stopped)
+		__smolkvm_gdb_wait_for_data(vm);
+#endif
 }
 
 /* Default loop for running the VM */
