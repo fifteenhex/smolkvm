@@ -67,6 +67,17 @@
 #define SMOLKVM_SZ_4K		(SMOLKVM_SZ_1K * 4)
 #define SMOLKVM_SZ_1MB		(SMOLKVM_SZ_1K * 1024)
 
+/*
+ * Where the MMIO devices live. This must be a 2MB aligned hole with no RAM in
+ * it: an access only reaches us (as a KVM_EXIT_MMIO) if no memslot covers the
+ * address. It must NOT be in low memory -- a stock OS assumes low memory is
+ * RAM and pokes around in it (Linux reads the EBDA pointer at 0x40e, scans
+ * 0xf0000+ for DMI/SMBIOS, ...), so low memory has to be backed by a memslot
+ * and devices have to live elsewhere. The initial page tables identity map
+ * one 2MB page here for the IPL.
+ */
+#define SMOLKVM_MMIO_HOLE_PHYS	0xD0000000ULL
+
 #endif
 /* -- */
 
@@ -136,8 +147,34 @@ static inline void __smolkvm_debug_dump_sregs(struct kvm_sregs *sregs)
 #endif
 /* -- */
 
+/* x86 arch defines */
+#ifdef SMOLKVM_FOLD
+
+#define SMOLKVM_X86_PTE_NUM	512
+/* Special register bits */
+#define SMOLKVM_X86_CR0_PE	SMOLKVM_BIT(0)
+#define SMOLKVM_X86_CR0_NW	SMOLKVM_BIT(29)
+#define SMOLKVM_X86_CR0_CD	SMOLKVM_BIT(30)
+#define SMOLKVM_X86_CR0_PG	SMOLKVM_BIT(31)
+#define SMOLKVM_X86_CR4_PSE	SMOLKVM_BIT(4)
+#define SMOLKVM_X86_CR4_PAE	SMOLKVM_BIT(5)
+#define SMOLKVM_X86_EFER_LME	SMOLKVM_BIT(8)
+#define SMOLKVM_X86_EFER_LMA	SMOLKVM_BIT(10)
+/* Page table bits */
+#define SMOLKVM_PTE_PRESENT	SMOLKVM_BIT(0)
+#define SMOLKVM_PTE_RW		SMOLKVM_BIT(1)
+#define SMOLKVM_PTE_PS		SMOLKVM_BIT(7)
+#define SMOLKVM_PTE_ADDR(_addr)	(((uint64_t)(_addr) >> 12) << 12)
+
+#endif
+/* -- */
+
 /* State structures */
 #ifdef SMOLKVM_FOLD
+
+struct smolkvm_pgtable {
+	uint64_t entries[SMOLKVM_X86_PTE_NUM];
+};
 
 
 struct smolkvm_vm {
@@ -146,6 +183,7 @@ struct smolkvm_vm {
 	int vm_fd;
 	struct kvm_run *vcpu_run;
 	size_t vcpu_run_sz;
+	struct smolkvm_pgtable *pgtables;
 
 	struct kvm_userspace_memory_region memregions[SMOLKVM_MEMREGIONS_NUM];
 	/* Running count only; per-slot occupancy (memory_size != 0) is authoritative */
@@ -351,6 +389,168 @@ int smolkvm_guest_write(struct smolkvm_vm *vm, uint64_t gpa, uint64_t len, const
 	return __smolkvm_memory_write(vm, gpa, len, src);
 }
 
+#endif
+/* -- */
+
+/* Early CPU init stuff, switch to longmode, initial guest page tables etc */
+#ifdef SMOLKVM_FOLD
+
+/*
+ * Low memory: identity mapped RAM covering 0..2MB, present so a stock OS can
+ * poke around in "the BIOS area" (EBDA pointer, DMI scan, sub 1MB trampoline
+ * allocation, ...) without hitting unhandled MMIO exits. Reads as zeros.
+ */
+#define SMOLKVM_LOWMEMORY_PHYS_START  0ULL
+#define SMOLKVM_LOWMEMORY_SZ          (SMOLKVM_SZ_1MB * 2)
+
+/* Base (IPL) memory is one huge page */
+#define SMOLKVM_BASEMEMORY_PHYS_START (SMOLKVM_SZ_1MB * 2)
+#define SMOLKVM_BASEMEMORY_SZ         (SMOLKVM_SZ_1MB * 2)
+#define SMOLKVM_BASEMEMORY_PHYS_END   (SMOLKVM_BASEMEMORY_PHYS_START + SMOLKVM_BASEMEMORY_SZ)
+#define SMOLKVM_PAGETABLE_OFF         (SMOLKVM_BASEMEMORY_SZ - (SMOLKVM_SZ_4K * 4))
+#define SMOLKVM_PAGETABLE_PHYS        (SMOLKVM_BASEMEMORY_PHYS_END - (SMOLKVM_SZ_4K * 4))
+#define SMOLKVM_PAGETABLE_PDPT_PHYS   (SMOLKVM_PAGETABLE_PHYS + SMOLKVM_SZ_4K)
+#define SMOLKVM_PAGETABLE_PD_PHYS     (SMOLKVM_PAGETABLE_PHYS + (SMOLKVM_SZ_4K * 2))
+#define SMOLKVM_PAGETABLE_PD_MMIO_PHYS (SMOLKVM_PAGETABLE_PHYS + (SMOLKVM_SZ_4K * 3))
+/* A real GDT lives in the page below the page tables */
+#define SMOLKVM_GDT_OFF               (SMOLKVM_PAGETABLE_OFF - SMOLKVM_SZ_4K)
+#define SMOLKVM_GDT_PHYS              (SMOLKVM_PAGETABLE_PHYS - SMOLKVM_SZ_4K)
+
+static inline void __smolkvm_create_initial_pagetables(struct smolkvm_vm *vm)
+{
+	void *memory = (void *) (vm->memregions[0].userspace_addr);
+	struct smolkvm_pgtable *pgtables =
+		(struct smolkvm_pgtable *)(memory +  SMOLKVM_PAGETABLE_OFF);
+	struct smolkvm_pgtable *pml4 = &pgtables[0];
+	struct smolkvm_pgtable *pdpt = &pgtables[1];
+	struct smolkvm_pgtable *pd = &pgtables[2];
+	struct smolkvm_pgtable *pd_mmio = &pgtables[3];
+
+	uint64_t *root = &pml4->entries[0];
+	uint64_t *onegb = &pdpt->entries[0];
+	uint64_t *mmiogb = &pdpt->entries[SMOLKVM_MMIO_HOLE_PHYS >> 30];
+	uint64_t *lowmem = &pd->entries[0];
+	uint64_t *mem = &pd->entries[1];
+	uint64_t *mmio = &pd_mmio->entries[(SMOLKVM_MMIO_HOLE_PHYS >> 21) & 0x1FF];
+
+	__smolkvm_debug("Page tables phy 0x%016llx, offset 0x%016llx\n",
+	       SMOLKVM_PAGETABLE_PHYS, SMOLKVM_PAGETABLE_OFF);
+
+	*root   = SMOLKVM_PTE_ADDR(SMOLKVM_PAGETABLE_PDPT_PHYS)
+	        | SMOLKVM_PTE_RW | SMOLKVM_PTE_PRESENT;
+	*onegb  = SMOLKVM_PTE_ADDR(SMOLKVM_PAGETABLE_PD_PHYS)
+	        | SMOLKVM_PTE_RW | SMOLKVM_PTE_PRESENT;
+	*mmiogb = SMOLKVM_PTE_ADDR(SMOLKVM_PAGETABLE_PD_MMIO_PHYS)
+	        | SMOLKVM_PTE_RW | SMOLKVM_PTE_PRESENT;
+	*lowmem = SMOLKVM_PTE_ADDR(SMOLKVM_LOWMEMORY_PHYS_START)
+	        | SMOLKVM_PTE_PS | SMOLKVM_PTE_RW | SMOLKVM_PTE_PRESENT;
+	*mem    = SMOLKVM_PTE_ADDR(SMOLKVM_BASEMEMORY_PHYS_START)
+	        | SMOLKVM_PTE_PS | SMOLKVM_PTE_RW | SMOLKVM_PTE_PRESENT;
+	*mmio   = SMOLKVM_PTE_ADDR(SMOLKVM_MMIO_HOLE_PHYS)
+	        | SMOLKVM_PTE_PS | SMOLKVM_PTE_RW | SMOLKVM_PTE_PRESENT;
+
+	vm->pgtables = pgtables;
+}
+
+#define SMOLKVM_SEG_TYPE_CODE_EXEC_READ 11
+#define SMOLKVM_SEG_TYPE_DATA_READ_WRITE 3
+
+static inline int __smolkvm_switch_cpu_into_longmode(struct smolkvm_vm *vm)
+{
+	/*
+	 * Selectors follow the 64-bit boot protocol's GDT layout: null,
+	 * reserved, __BOOT_CS (0x10), __BOOT_DS (0x18).
+	 */
+	const struct kvm_segment cs = {
+		.base = 0,
+		.limit = 0xFFFFFFFF,
+		.selector = 0x10,
+		.type = SMOLKVM_SEG_TYPE_CODE_EXEC_READ,
+		.present = 1,
+		.s = 1,
+		.l = 1,
+		.g = 1,
+	};
+	const struct kvm_segment ds = {
+		.base = 0,
+		.limit = 0xFFFFFFFF,
+		.selector = 0x18,
+		.type = SMOLKVM_SEG_TYPE_DATA_READ_WRITE,
+		.present = 1,
+		.s = 1,
+		.l = 0,
+		.g = 1,
+	};
+	void *memory = (void *) (vm->memregions[0].userspace_addr);
+	uint64_t *gdt = (uint64_t *) (memory + SMOLKVM_GDT_OFF);
+	struct kvm_sregs sregs = { 0 };
+	int ret;
+
+	/*
+	 * A real GDT backing the selectors above. KVM_SET_SREGS loads the
+	 * descriptor caches directly so nothing strictly reads this, but a
+	 * GDTR pointing at nothing is out of spec and anything reloading a
+	 * segment before installing its own GDT would triple fault.
+	 */
+	gdt[0] = 0;			/* null */
+	gdt[1] = 0;			/* reserved */
+	gdt[2] = 0x00af9b000000ffffULL;	/* 0x10: code, exec/read, L, G */
+	gdt[3] = 0x00cf93000000ffffULL;	/* 0x18: data, read/write, G */
+
+	ret = __smolkvm_get_sregs(vm, &sregs);
+	if (ret)
+		return -SMOLKVM_ERR_CREATE_GETSREGS;
+
+	sregs.gdt.base = SMOLKVM_GDT_PHYS;
+	sregs.gdt.limit = 4 * 8 - 1;
+
+	printf("Special registers before longmode setup\n");
+	__smolkvm_debug_dump_sregs(&sregs);
+
+	/* Use the pagetables we put at the end of memory */
+	sregs.cr3 = SMOLKVM_PAGETABLE_PHYS;
+
+	/* Protected mode, long mode, all of that fun stuff */
+	sregs.cr0 |= SMOLKVM_X86_CR0_PE | SMOLKVM_X86_CR0_PG;
+	/* The reset state has caches disabled; a stock OS never expects that */
+	sregs.cr0 &= ~(SMOLKVM_X86_CR0_CD | SMOLKVM_X86_CR0_NW);
+	sregs.cr4 |= SMOLKVM_X86_CR4_PSE | SMOLKVM_X86_CR4_PAE;
+	sregs.efer |= SMOLKVM_X86_EFER_LMA | SMOLKVM_X86_EFER_LME;
+
+	/* Setup the code and data segments */
+	sregs.cs = cs;
+	sregs.ds = sregs.es = sregs.fs = sregs.gs = sregs.ss = ds;
+
+	__smolkvm_debug("Special registers after longmode setup\n");
+	__smolkvm_debug_dump_sregs(&sregs);
+
+	ret = ioctl(vm->vcpu_fd, KVM_SET_SREGS, &sregs);
+	if (ret) {
+		printf("%d\n", errno);
+		return -SMOLKVM_ERR_CREATE_SETSREGS;
+	}
+
+	return 0;
+}
+
+int __smolkvm_set_rip(struct smolkvm_vm *vm)
+{
+	struct kvm_regs regs = { 0 };
+	int ret;
+
+	ret = __smolkvm_get_regs(vm, &regs);
+	if (ret)
+		return -SMOLKVM_ERR_CREATE_GETREGS;
+
+	regs.rip = SMOLKVM_BASEMEMORY_PHYS_START;
+	regs.rflags = 0x2;
+
+	ret = __smolkvm_set_regs(vm, &regs);
+	if (ret)
+		return -SMOLKVM_ERR_CREATE_SETREGS;
+
+	return 0;
+}
 #endif
 /* -- */
 
