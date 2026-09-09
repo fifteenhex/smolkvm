@@ -323,6 +323,136 @@ static inline int __smolkvm_set_guest_debug(struct smolkvm_vm *vm, const struct 
 #endif
 /* -- */
 
+/* signal stuff */
+#ifdef SMOLKVM_FOLD
+
+/* So the SIGIO handler can reach the (one) vCPU's shared run structure */
+static struct kvm_run *volatile __smolkvm_sigio_kvm_run;
+
+static inline void __smolkvm_signal_sigio(int signum)
+{
+	// Just exit the KVM run call.
+
+	/*
+	 * ...and make sure the *next* KVM_RUN returns right away too: if this
+	 * signal lands after the loop has drained the sockets but before the
+	 * ioctl enters the kernel, the EINTR alone is lost and an idle
+	 * (HLTed) guest would sit in KVM_RUN with input already waiting.
+	 * The loop clears the flag before polling the devices.
+	 */
+	if (__smolkvm_sigio_kvm_run)
+		__smolkvm_sigio_kvm_run->immediate_exit = 1;
+}
+
+static inline int __smolkvm_setup_sighandler(void)
+{
+	struct sigaction sa = { 0 };
+	sa.sa_handler = __smolkvm_signal_sigio;
+
+	sigemptyset(&sa.sa_mask);
+
+	sigaction(SIGIO, &sa, NULL);
+
+	return 0;
+}
+
+#endif
+/* -- */
+
+/* Network functions */
+#ifdef SMOLKVM_FOLD
+
+static int __smolkvm_make_socket_trigger_sigio(int sock)
+{
+	int flags;
+
+	fcntl(sock, F_SETOWN, getpid());
+	flags = fcntl(sock, F_GETFL);
+	fcntl(sock, F_SETFL, flags | O_ASYNC);
+
+	return 0;
+}
+
+static int __smolkvm_create_server_socket(int port)
+{
+	int opt = 1;
+	int sock;
+	int ret;
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_port = htons(port),
+		.sin_addr = htonl(INADDR_ANY),
+	};
+
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+
+	if (sock < 0) {
+		printf("failed to create socket\n");
+		return -1;
+	}
+
+	ret = setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	if (ret) {
+		printf("failed to set socket options\n");
+		goto err_close_sock;
+	}
+
+	ret = bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+	if (ret < 0) {
+		printf("failed to bind socket\n");
+		goto err_close_sock;
+	}
+
+	ret = listen(sock, 1);
+	if (ret < 0) {
+		printf("failed to listen on socket\n");
+		goto err_close_sock;
+	}
+
+	return sock;
+
+err_close_sock:
+	close(sock);
+	return -1;
+}
+
+static int __smolkvm_create_unix_domain_socket(const char *path)
+{
+	struct sockaddr_un addr = { 0 };
+	int sock;
+	int ret;
+
+	addr.sun_family = AF_UNIX;
+	strcpy(addr.sun_path, path);
+
+	sock = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	if (sock < 0)
+		return -1;
+
+	unlink(path);
+
+	ret = bind(sock, (struct sockaddr*)&addr, sizeof(addr));
+	if (ret) {
+		printf("failed to bind socket\n");
+		goto err_close_sock;
+	}
+
+	ret = listen(sock, 1);
+	if (ret) {
+		printf("failed to listen on socket\n");
+		goto err_close_sock;
+	}
+
+	return sock;
+
+err_close_sock:
+	close(sock);
+	return -1;
+}
+
+#endif
+/* -- */
+
 /* mmio handling */
 #ifdef SMOLKVM_FOLD
 
@@ -966,6 +1096,11 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 	if (ret)
 		return ret;
 
+//
+	__smolkvm_sigio_kvm_run = vcpu_run;
+	__smolkvm_setup_sighandler();
+//
+
 	return 0;
 }
 
@@ -1080,6 +1215,13 @@ static void __smolkvm_stop(struct smolkvm_vm *vm)
 static void __smolkvm_default_loop_pre_run(struct smolkvm_vm *vm)
 {
 	struct smolkvm_mmio **mmio;
+
+	/*
+	 * Clear before draining the devices: a SIGIO between here and KVM_RUN
+	 * sets it again and the run returns immediately instead of losing the
+	 * wakeup (see __smolkvm_signal_sigio()).
+	 */
+	vm->vcpu_run->immediate_exit = 0;
 
 	__smolkvm_foreach_mmio(vm, mmio) {
 		if ((*mmio)->pre_run)
