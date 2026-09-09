@@ -605,9 +605,16 @@ static inline int __smolkvm_handle_mmio(struct smolkvm_vm *vm)
 	return 0;
 }
 
+#ifdef SMOLKVM_WANT_APIC
+/* Defined with the console below; returns true if it claimed the access */
+static inline bool __smolkvm_uart_handle_io(struct smolkvm_vm *vm);
+#endif
+
 /*
- * Port IO. Nothing is emulated: every port reads as 0xFF / swallows
- * writes, which is what a PC with nothing on the bus looks like.
+ * Port IO. Only the legacy COM1 UART is emulated (SMOLKVM_WANT_APIC); every
+ * other port reads as 0xFF / swallows writes, which is what a PC with nothing
+ * on the bus looks like, so a stock OS probing for hardware (PCI config,
+ * i8042, RTC, ...) concludes it is absent and moves on.
  */
 static inline int __smolkvm_handle_io(struct smolkvm_vm *vm)
 {
@@ -618,6 +625,11 @@ static inline int __smolkvm_handle_io(struct smolkvm_vm *vm)
 
 	__smolkvm_debug("io %s port 0x%x, size %u, count %u\n",
 			is_in ? "in" : "out", run->io.port, run->io.size, run->io.count);
+
+#ifdef SMOLKVM_WANT_APIC
+	if (__smolkvm_uart_handle_io(vm))
+		return 0;
+#endif
 
 	if (is_in)
 		memset(data, 0xFF, total);
@@ -761,11 +773,19 @@ static int __smolkvm_console_check_for_connection(struct smolkvm_vm *vm,
 	return 1;
 }
 
+#ifdef SMOLKVM_WANT_APIC
+static void __smolkvm_uart_update_irq(struct smolkvm_vm *vm);
+#endif
+
 static void __smolkvm_console_pre_run(struct smolkvm_vm *vm,
 				      struct smolkvm_mmio *mmio)
 {
 	__smolkvm_console_check_for_connection(vm, mmio);
 	__smolkvm_console_check_for_data_from_socket(vm, mmio);
+#ifdef SMOLKVM_WANT_APIC
+	/* New rx data might need to interrupt the guest */
+	__smolkvm_uart_update_irq(vm);
+#endif
 }
 
 static uint64_t __smolkvm_console_read(struct smolkvm_vm *vm,
@@ -849,6 +869,205 @@ static inline int __smolkvm_console_create(struct smolkvm_vm *vm)
 	return 0;
 }
 
+#endif
+/* -- */
+
+/* COM1: just enough 16550 for Linux's ttyS0 (SMOLKVM_WANT_APIC machines) */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_APIC
+
+/*
+ * Every x86 Linux kernel registers ttyS0 at 0x3f8/irq4 without being told
+ * about it (SERIAL_PORT_DFNS), so emulating the legacy COM1 is the smallest
+ * possible path to a guest console: no ACPI/DT description, no driver.
+ * It shares the rx fifo and socket with the MMIO console above.
+ *
+ * Emulation notes:
+ *  - The transmitter has no fifo and is always empty: a THR write goes
+ *    straight out to the socket.
+ *  - IER/LCR/MCR/SCR/DLL/DLM are plain latches; enough for the 8250 driver's
+ *    existence test (IER readback + scratch register).
+ *  - FCR is ignored and IIR never reports fifos, so the driver detects a
+ *    plain 8250 and does single byte tx per THRE interrupt.
+ *  - The interrupt is driven through KVM_IRQ_LINE as a level that follows
+ *    "rx data available" / "THRE pending", which gives the in-kernel
+ *    PIC/IOAPIC the edges it wants. THRE is a one-shot: raised by a THR
+ *    write (or enabling IER.THRI), cleared when the guest sees it in IIR.
+ */
+#define SMOLKVM_UART_PORT	0x3f8
+#define SMOLKVM_UART_IRQ	4
+
+#define __SMOLKVM_UART_REG_RBR	0	/* DLAB=0: read rx / write tx */
+#define __SMOLKVM_UART_REG_IER	1	/* DLAB=0 */
+#define __SMOLKVM_UART_REG_IIR	2	/* read (write is FCR, ignored) */
+#define __SMOLKVM_UART_REG_LCR	3
+#define __SMOLKVM_UART_REG_MCR	4
+#define __SMOLKVM_UART_REG_LSR	5
+#define __SMOLKVM_UART_REG_MSR	6
+#define __SMOLKVM_UART_REG_SCR	7
+
+#define __SMOLKVM_UART_IER_RDI	0x01	/* rx data interrupt enable */
+#define __SMOLKVM_UART_IER_THRI	0x02	/* tx holding empty interrupt enable */
+#define __SMOLKVM_UART_IIR_NONE	0x01
+#define __SMOLKVM_UART_IIR_THRE	0x02
+#define __SMOLKVM_UART_IIR_RDI	0x04
+#define __SMOLKVM_UART_LCR_DLAB	0x80
+#define __SMOLKVM_UART_LSR_DR	0x01
+#define __SMOLKVM_UART_LSR_THRE	0x20
+#define __SMOLKVM_UART_LSR_TEMT	0x40
+/* CTS + DSR + DCD: we are always "connected" */
+#define __SMOLKVM_UART_MSR_LINES 0xB0
+
+struct __smolkvm_uart_priv {
+	uint8_t ier, lcr, mcr, scr, dll, dlm;
+	bool thre_pending;	/* one-shot THRE interrupt source */
+	bool irq_level;		/* what we last told KVM_IRQ_LINE */
+};
+
+static struct __smolkvm_uart_priv __smolkvm_uart_priv;
+
+static void __smolkvm_irq_line(struct smolkvm_vm *vm, unsigned int irq, int level)
+{
+	struct kvm_irq_level irq_level = {
+		.irq = irq,
+		.level = level,
+	};
+
+	if (ioctl(vm->vm_fd, KVM_IRQ_LINE, &irq_level))
+		__smolkvm_debug("KVM_IRQ_LINE failed: %d\n", errno);
+}
+
+static void __smolkvm_uart_update_irq(struct smolkvm_vm *vm)
+{
+	struct __smolkvm_uart_priv *u = &__smolkvm_uart_priv;
+	bool level = false;
+
+	if ((u->ier & __SMOLKVM_UART_IER_RDI) &&
+	    !__smolkvm_fifo_is_empty(&__smolkvm_console_priv.fifo_rx))
+		level = true;
+
+	if ((u->ier & __SMOLKVM_UART_IER_THRI) && u->thre_pending)
+		level = true;
+
+	if (level != u->irq_level) {
+		__smolkvm_irq_line(vm, SMOLKVM_UART_IRQ, level);
+		u->irq_level = level;
+	}
+}
+
+static uint8_t __smolkvm_uart_read8(struct smolkvm_vm *vm, uint16_t offset)
+{
+	struct __smolkvm_uart_priv *u = &__smolkvm_uart_priv;
+	struct __smolkvm_console_fifo *fifo_rx = &__smolkvm_console_priv.fifo_rx;
+	bool dlab = u->lcr & __SMOLKVM_UART_LCR_DLAB;
+	uint8_t val = 0;
+
+	switch (offset) {
+	case __SMOLKVM_UART_REG_RBR:
+		if (dlab)
+			return u->dll;
+		if (!__smolkvm_fifo_is_empty(fifo_rx))
+			val = __smolkvm_fifo_consume(fifo_rx);
+		__smolkvm_uart_update_irq(vm);
+		return val;
+	case __SMOLKVM_UART_REG_IER:
+		return dlab ? u->dlm : u->ier;
+	case __SMOLKVM_UART_REG_IIR:
+		if ((u->ier & __SMOLKVM_UART_IER_RDI) &&
+		    !__smolkvm_fifo_is_empty(fifo_rx))
+			return __SMOLKVM_UART_IIR_RDI;
+		if ((u->ier & __SMOLKVM_UART_IER_THRI) && u->thre_pending) {
+			/* Reading IIR acknowledges the THRE interrupt */
+			u->thre_pending = false;
+			__smolkvm_uart_update_irq(vm);
+			return __SMOLKVM_UART_IIR_THRE;
+		}
+		return __SMOLKVM_UART_IIR_NONE;
+	case __SMOLKVM_UART_REG_LCR:
+		return u->lcr;
+	case __SMOLKVM_UART_REG_MCR:
+		return u->mcr;
+	case __SMOLKVM_UART_REG_LSR:
+		val = __SMOLKVM_UART_LSR_THRE | __SMOLKVM_UART_LSR_TEMT;
+		if (!__smolkvm_fifo_is_empty(fifo_rx))
+			val |= __SMOLKVM_UART_LSR_DR;
+		return val;
+	case __SMOLKVM_UART_REG_MSR:
+		return __SMOLKVM_UART_MSR_LINES;
+	case __SMOLKVM_UART_REG_SCR:
+		return u->scr;
+	}
+
+	return 0;
+}
+
+static void __smolkvm_uart_write8(struct smolkvm_vm *vm, uint16_t offset, uint8_t val)
+{
+	struct __smolkvm_uart_priv *u = &__smolkvm_uart_priv;
+	bool dlab = u->lcr & __SMOLKVM_UART_LCR_DLAB;
+
+	switch (offset) {
+	case __SMOLKVM_UART_REG_RBR:
+		if (dlab) {
+			u->dll = val;
+			return;
+		}
+		__smolkvm_console_tx_byte(val);
+		/* The byte is "sent" instantly, so THR is empty again */
+		u->thre_pending = true;
+		__smolkvm_uart_update_irq(vm);
+		return;
+	case __SMOLKVM_UART_REG_IER:
+		if (dlab) {
+			u->dlm = val;
+			return;
+		}
+		if ((val & __SMOLKVM_UART_IER_THRI) &&
+		    !(u->ier & __SMOLKVM_UART_IER_THRI))
+			u->thre_pending = true;
+		u->ier = val & 0x0F;
+		__smolkvm_uart_update_irq(vm);
+		return;
+	case __SMOLKVM_UART_REG_IIR:	/* FCR: no fifos here */
+		return;
+	case __SMOLKVM_UART_REG_LCR:
+		u->lcr = val;
+		return;
+	case __SMOLKVM_UART_REG_MCR:
+		u->mcr = val;
+		return;
+	case __SMOLKVM_UART_REG_SCR:
+		u->scr = val;
+		return;
+	}
+}
+
+static inline bool __smolkvm_uart_handle_io(struct smolkvm_vm *vm)
+{
+	struct kvm_run *run = vm->vcpu_run;
+	bool is_in = run->io.direction == KVM_EXIT_IO_IN;
+	uint8_t *data = (uint8_t *) run + run->io.data_offset;
+	uint16_t offset;
+	uint32_t i;
+
+	if (run->io.port < SMOLKVM_UART_PORT ||
+	    run->io.port >= SMOLKVM_UART_PORT + 8 ||
+	    run->io.size != 1)
+		return false;
+
+	offset = run->io.port - SMOLKVM_UART_PORT;
+
+	for (i = 0; i < run->io.count; i++) {
+		if (is_in)
+			data[i] = __smolkvm_uart_read8(vm, offset);
+		else
+			__smolkvm_uart_write8(vm, offset, data[i]);
+	}
+
+	return true;
+}
+
+#endif /* SMOLKVM_WANT_APIC */
 #endif
 /* -- */
 
