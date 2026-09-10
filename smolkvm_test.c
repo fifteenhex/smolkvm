@@ -193,24 +193,27 @@ int main(int argc, char **argv, char **envp)
 
 	printf("Built %s @ %s\n", __DATE__, __TIME__);
 
-	ret = smolkvm_create_vm(&vm);
-	if (ret) {
-		printf("smolkvm_create_vm() failed: %d\n", ret);
-		return 1;
-	}
-
+	/*
+	 * Dumping the machine header only reads compile-time constants, so do
+	 * it before (and instead of) creating the VM: this path must work on a
+	 * build host with no /dev/kvm, e.g. CI generating ipl/include/machine.h.
+	 */
 	if (header_path) {
 		FILE *header = fopen(header_path, "w");
 		if (!header) {
 			fprintf(stderr, "could not open %s for writing\n", header_path);
-			smolkvm_destroy_vm(&vm);
 			return 1;
 		}
 
-		smolkvm_dump_register_header(&vm, header);
+		smolkvm_dump_register_header_novm(header);
 		fclose(header);
-		smolkvm_destroy_vm(&vm);
 		return 0;
+	}
+
+	ret = smolkvm_create_vm(&vm);
+	if (ret) {
+		printf("smolkvm_create_vm() failed: %d\n", ret);
+		return 1;
 	}
 
 	ret = smolkvm_mailbox_register(&vm, MAILBOX_CMD_GETPARAMS, &getparams,

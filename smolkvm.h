@@ -3317,6 +3317,31 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 	return 0;
 }
 
+/*
+ * Emit the machine's register header without creating a VM. Every address in
+ * it -- the MMIO device layout, the fixed memory/pagetable/APIC constants -- is
+ * a compile-time constant, so nothing here needs /dev/kvm. This is what lets a
+ * build host with no KVM (CI, a cross build) generate ipl/include/machine.h.
+ *
+ * We plug in the same MMIO devices smolkvm_create_vm() does, but only their
+ * static metadata (name/phys/len/registers); the host resources the real
+ * devices acquire (the console socket, timer state, ...) are never consulted
+ * by the dump, so they are skipped.
+ */
+void smolkvm_dump_register_header_novm(FILE *out)
+{
+	struct smolkvm_vm vm = { 0 };
+
+	__smolkvm_plugin_mmio(&vm, &__smolkvm_console);
+	__smolkvm_plugin_mmio(&vm, &__smolkvm_mailbox);
+#ifdef SMOLKVM_WANT_SIMPLE
+	__smolkvm_plugin_mmio(&vm, &__smolkvm_irqchip);
+	__smolkvm_plugin_mmio(&vm, &__smolkvm_timer);
+#endif
+
+	smolkvm_dump_register_header(&vm, out);
+}
+
 void smolkvm_destroy_vm(struct smolkvm_vm *vm)
 {
 	munmap(vm->vcpu_run, vm->vcpu_run_sz);
