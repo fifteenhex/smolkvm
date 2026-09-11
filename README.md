@@ -23,9 +23,16 @@ This is a single header implementation of a very crappy "virtual machine".
   UART, boots stock Linux).
 - meh grade gdb stub.
 - lots of bugs
-- It should, eventually, compile to a completely self standing static binary
-  with nolibc at some point but nolibc needs to get wrappers for the socket
-  stuff and signal support.
+- Compiles to a completely self standing static binary with nolibc: pass
+  both `NOLIBCDIR` (your nolibc, e.g. `tools/include/nolibc` in the linux
+  source) and `NOLIBCEXTDIR` (a checkout of nolibc-extensions, which adds
+  the sockets/fcntl/signal bits nolibc doesn't carry yet):
+
+  ```
+  make NOLIBCDIR=/path/to/nolibc NOLIBCEXTDIR=/path/to/nolibc-extensions
+  ```
+
+  builds `smolkvm_test` and `smolkvm_test_gdb` as static nolibc binaries.
 
 ## Booting Linux
 

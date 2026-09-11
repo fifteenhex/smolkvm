@@ -1,7 +1,10 @@
 #ifndef _PARAMS_H
 #define _PARAMS_H
 
+/* nolibc provides the fixed-width types itself and clashes with <stdint.h> */
+#ifndef NOLIBC
 #include <stdint.h>
+#endif
 
 struct cmd_buffer_getparams {
 	uint64_t params_ptr;

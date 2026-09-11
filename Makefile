@@ -46,14 +46,25 @@ $(IPL): ipl/include/machine.h
 	$(MAKE) -C ipl/
 
 ifdef NOLIBCDIR
+ifndef NOLIBCEXTDIR
+$(warning Please also pass NOLIBCEXTDIR with the path to your nolibc-extensions checkout for static targets)
+else
 all: smolkvm_test smolkvm_test_gdb
 
+# Force-include nolibc, then the extensions umbrella on top -- the order lets
+# the extensions defer to anything a given nolibc already carries. The
+# extensions supply what smolkvm needs beyond stock nolibc: unix + tcp
+# sockets, fcntl(), and the sigset helpers.
+NOLIBC_INC = -include $(NOLIBCDIR)/nolibc.h \
+	     -include $(NOLIBCEXTDIR)/include/nolibc-extensions.h
+
 smolkvm_test: smolkvm_test.c smolkvm.h $(IPL)
-	$(CC) -DSMOLKVM_WANT_APIC -nostdlib -include $(NOLIBCDIR)/nolibc.h $(COPTS) -static -o $@ $< -lgcc
+	$(CC) -DSMOLKVM_WANT_APIC -nostdlib $(NOLIBC_INC) $(COPTS) -static -o $@ $< -lgcc
 
 # -DSMOLKVM_WANT_GDB_STUB_DEBUG
 smolkvm_test_gdb: smolkvm_test.c smolkvm.h $(IPL)
-	$(CC) -DSMOLKVM_WANT_APIC -DSMOLKVM_WANT_GDB_STUB -nostdlib -include $(NOLIBCDIR)/nolibc.h $(COPTS) -static -o $@ $< -lgcc
+	$(CC) -DSMOLKVM_WANT_APIC -DSMOLKVM_WANT_GDB_STUB -nostdlib $(NOLIBC_INC) $(COPTS) -static -o $@ $< -lgcc
+endif
 else
 $(warning Please pass NOLIBCDIR with the path to your copy of nolibc (tools/include/nolibc/ in the linux source) for static targets)
 endif

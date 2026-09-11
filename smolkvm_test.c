@@ -2,7 +2,9 @@
 #include "ipl/include/params.h"
 #include "ipl/include/loadkernel.h"
 
+#ifndef NOLIBC
 #include <unistd.h>
+#endif
 
 #define MAILBOX_CMD_GETPARAMS (SMOLKVM_MAILBOX_CMD_MINUSER + 0)
 #define MAILBOX_CMD_LOADKERNEL (SMOLKVM_MAILBOX_CMD_MINUSER + 1)
