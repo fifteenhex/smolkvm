@@ -28,6 +28,14 @@
 
 #include <linux/kvm.h>
 
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+/*
+ * The RFB (VNC) server the virtio-gpu scanout ends up in. It is a header of
+ * its own, so point the compiler at a checkout: -I/path/to/smolrfb
+ */
+#include <smolrfb.h>
+#endif
+
 /*
  * SMoLKVM - Your favourite single header crappy implementation of KVM userspace.
  *
@@ -58,6 +66,11 @@
  *   SMOLKVM_WANT_GDB_STUB_DEBUG  -- Add noisy debug messages for the stub.
  *   SMOLKVM_WANT_SIMPLE          -- Machine with the simple polled irqchip + timer (default).
  *   SMOLKVM_WANT_APIC            -- Machine with the in-kernel APIC + PIT (boots stock OSes).
+ *   SMOLKVM_WANT_VIRTIO_GPU      -- Add a virtio-gpu whose scanout is served over VNC by
+ *                                   smolrfb. Needs SMOLKVM_WANT_APIC and -I<smolrfb>.
+ *   SMOLKVM_VIRTIO_GPU_WIDTH     -- Display size, see defaults below. Both can also be set
+ *   SMOLKVM_VIRTIO_GPU_HEIGHT       at runtime with smolkvm_virtio_gpu_configure().
+ *   SMOLKVM_VIRTIO_GPU_PORT      -- Port the RFB server listens on (loopback only by default).
  */
 #ifdef SMOLKVM_FOLD
 
@@ -88,10 +101,10 @@
 #error "smolkvm: define only one of SMOLKVM_WANT_SIMPLE or SMOLKVM_WANT_APIC"
 #endif
 
-/*
- * The transport is compiled in when a device that rides it is; nothing
- * defines this on its own yet.
- */
+/* Anything that rides the virtio-mmio transport pulls the transport in */
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+#define SMOLKVM_WANT_VIRTIO
+#endif
 #if !defined(SMOLKVM_WANT_SIMPLE) && !defined(SMOLKVM_WANT_APIC)
 #define SMOLKVM_WANT_SIMPLE
 #endif
@@ -150,6 +163,7 @@
 #define SMOLKVM_ERR_SET_CPUID       115
 #define SMOLKVM_ERR_CREATE_IRQCHIP  116
 #define SMOLKVM_ERR_CREATE_PIT      117
+#define SMOLKVM_ERR_CREATE_VIRTIO_GPU 118
 
 #endif
 /* -- */
@@ -3630,6 +3644,905 @@ static const struct smolkvm_mmio_reg __smolkvm_virtio_mmio_regs[] = {
 #endif
 /* -- */
 
+/* virtio-gpu: a 2D scanout on a virtio-mmio transport, shown by smolrfb */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+
+/*
+ * A virtio-gpu (2D) device whose scanout is served to VNC viewers by smolrfb:
+ * the guest's DRM driver draws into its own memory, says which rectangle
+ * changed, and those pixels go down a socket.
+ *
+ * Implemented:
+ *
+ *  - split virtqueues: a control queue, and a cursor queue that completes
+ *    every request without drawing anything (the driver will not probe
+ *    without one, and a cursor is not worth the pixels over a wire)
+ *  - one scanout, of a size fixed before the first client connects: there is
+ *    no desktop resize in smolrfb, so the guest gets exactly one mode
+ *  - the 2D commands a framebuffer console needs: GET_DISPLAY_INFO,
+ *    RESOURCE_CREATE_2D / UNREF, RESOURCE_ATTACH / DETACH_BACKING,
+ *    SET_SCANOUT, TRANSFER_TO_HOST_2D and RESOURCE_FLUSH.
+ *
+ * Not implemented:
+ *
+ *  - 3D/virgl, blob resources, EDID, capsets. None are offered as features
+ *    and the commands are answered with ERR_UNSPEC.
+ *  - host side storage for a resource that is not the current scanout: a
+ *    transfer into one of those is accepted and dropped. Binding a resource
+ *    to the scanout pulls all of it in, so the first frame after a modeset is
+ *    right anyway, which is the only case that would have noticed.
+ */
+
+#ifndef SMOLKVM_WANT_APIC
+#error "smolkvm: SMOLKVM_WANT_VIRTIO_GPU needs SMOLKVM_WANT_APIC (the driver wants a real interrupt)"
+#endif
+
+#define SMOLKVM_VIRTIO_GPU_PHYS		(SMOLKVM_MMIO_HOLE_PHYS + 0x4000)
+#define SMOLKVM_VIRTIO_GPU_LEN		0x1000
+/* 4 is the UART's; 5 is free on a PC with no sound card and no second LPT */
+#define SMOLKVM_VIRTIO_GPU_IRQ		5
+
+#ifndef SMOLKVM_VIRTIO_GPU_WIDTH
+#define SMOLKVM_VIRTIO_GPU_WIDTH	1024
+#endif
+
+#ifndef SMOLKVM_VIRTIO_GPU_HEIGHT
+#define SMOLKVM_VIRTIO_GPU_HEIGHT	768
+#endif
+
+/* The usual first VNC display, :0 */
+#ifndef SMOLKVM_VIRTIO_GPU_PORT
+#define SMOLKVM_VIRTIO_GPU_PORT		5900
+#endif
+
+#ifndef SMOLKVM_VIRTIO_GPU_RESOURCES_NUM
+#define SMOLKVM_VIRTIO_GPU_RESOURCES_NUM	16
+#endif
+
+/*
+ * Cap on one resource's backing list. The guest picks nr_entries and we
+ * allocate to match, so without a limit it can ask for silly amounts and OOM
+ * the host. 16K entries is 64MB of pixels at one 4K page per entry, far past
+ * any scanout that fits in here.
+ */
+#ifndef SMOLKVM_VIRTIO_GPU_BACKING_MAX
+#define SMOLKVM_VIRTIO_GPU_BACKING_MAX	16384
+#endif
+
+/* Descriptors per queue. The driver keeps a handful in flight; this is slack. */
+#ifndef SMOLKVM_VIRTIO_GPU_QUEUE_SZ
+#define SMOLKVM_VIRTIO_GPU_QUEUE_SZ	256
+#endif
+
+/* control queue, cursor queue -- the driver refuses to probe without both */
+#define __SMOLKVM_VIRTIO_GPU_QUEUES_NUM	2
+#define __SMOLKVM_VIRTIO_GPU_QUEUE_CTRL	0
+#define __SMOLKVM_VIRTIO_GPU_QUEUE_CURSOR 1
+
+/* virtio-gpu command and response headers (linux/virtio_gpu.h) */
+#define __SMOLKVM_VIRTIO_GPU_CMD_GET_DISPLAY_INFO	0x0100
+#define __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_CREATE_2D	0x0101
+#define __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_UNREF		0x0102
+#define __SMOLKVM_VIRTIO_GPU_CMD_SET_SCANOUT		0x0103
+#define __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_FLUSH		0x0104
+#define __SMOLKVM_VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D	0x0105
+#define __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING 0x0106
+#define __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING 0x0107
+
+#define __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA		0x1100
+#define __SMOLKVM_VIRTIO_GPU_RESP_OK_DISPLAY_INFO	0x1101
+#define __SMOLKVM_VIRTIO_GPU_RESP_ERR_UNSPEC		0x1200
+#define __SMOLKVM_VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY	0x1201
+#define __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID  0x1202
+#define __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID 0x1203
+#define __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER	0x1205
+
+#define __SMOLKVM_VIRTIO_GPU_FLAG_FENCE		SMOLKVM_BIT(0)
+#define __SMOLKVM_VIRTIO_GPU_MAX_SCANOUTS	16
+
+/*
+ * The two formats Linux's drm/virtio ever asks for: DRM_FORMAT_XRGB8888 and
+ * ARGB8888. Both are one 32-bit word per pixel holding 0xAARRGGBB on a
+ * little-endian machine -- which is exactly what smolrfb wants, so a transfer
+ * is a memcpy and the alpha byte is simply never looked at. Anything else is
+ * refused rather than drawn as garbage.
+ */
+#define __SMOLKVM_VIRTIO_GPU_FORMAT_B8G8R8A8	1
+#define __SMOLKVM_VIRTIO_GPU_FORMAT_B8G8R8X8	2
+
+struct __smolkvm_virtio_gpu_ctrl_hdr {
+	uint32_t type;
+	uint32_t flags;
+	uint64_t fence_id;
+	uint32_t ctx_id;
+	uint8_t ring_idx;
+	uint8_t padding[3];
+};
+
+struct __smolkvm_virtio_gpu_rect {
+	uint32_t x;
+	uint32_t y;
+	uint32_t width;
+	uint32_t height;
+};
+
+struct __smolkvm_virtio_gpu_resource_create_2d {
+	uint32_t resource_id;
+	uint32_t format;
+	uint32_t width;
+	uint32_t height;
+};
+
+struct __smolkvm_virtio_gpu_resource_unref {
+	uint32_t resource_id;
+	uint32_t padding;
+};
+
+struct __smolkvm_virtio_gpu_set_scanout {
+	struct __smolkvm_virtio_gpu_rect r;
+	uint32_t scanout_id;
+	uint32_t resource_id;
+};
+
+struct __smolkvm_virtio_gpu_resource_flush {
+	struct __smolkvm_virtio_gpu_rect r;
+	uint32_t resource_id;
+	uint32_t padding;
+};
+
+struct __smolkvm_virtio_gpu_transfer_to_host_2d {
+	struct __smolkvm_virtio_gpu_rect r;
+	uint64_t offset;
+	uint32_t resource_id;
+	uint32_t padding;
+};
+
+struct __smolkvm_virtio_gpu_attach_backing {
+	uint32_t resource_id;
+	uint32_t nr_entries;
+};
+
+struct __smolkvm_virtio_gpu_mem_entry {
+	uint64_t addr;
+	uint32_t length;
+	uint32_t padding;
+};
+
+struct __smolkvm_virtio_gpu_display_one {
+	struct __smolkvm_virtio_gpu_rect r;
+	uint32_t enabled;
+	uint32_t flags;
+};
+
+struct __smolkvm_virtio_gpu_resp_display_info {
+	struct __smolkvm_virtio_gpu_ctrl_hdr hdr;
+	struct __smolkvm_virtio_gpu_display_one pmodes[__SMOLKVM_VIRTIO_GPU_MAX_SCANOUTS];
+};
+
+/* The device configuration space at __SMOLKVM_VIRTIO_MMIO_CONFIG */
+struct __smolkvm_virtio_gpu_config {
+	uint32_t events_read;
+	uint32_t events_clear;
+	uint32_t num_scanouts;
+	uint32_t num_capsets;
+	uint32_t blob_alignment;
+};
+
+/* A guest allocated 2D resource: a size, a format and a scattered backing */
+struct __smolkvm_virtio_gpu_resource {
+	uint32_t id;		/* 0 = this slot is free; the spec reserves 0 */
+	uint32_t format;
+	uint32_t width;
+	uint32_t height;
+
+	struct __smolkvm_virtio_gpu_mem_entry *backing;
+	uint32_t nr_entries;
+};
+
+struct __smolkvm_virtio_gpu_priv {
+	/* The queues the transport drives; it owns everything else about it */
+	struct __smolkvm_virtq vq[__SMOLKVM_VIRTIO_GPU_QUEUES_NUM];
+
+	/* device */
+	struct __smolkvm_virtio_gpu_config config;
+	struct __smolkvm_virtio_gpu_resource res[SMOLKVM_VIRTIO_GPU_RESOURCES_NUM];
+	uint32_t scanout_res;	/* resource bound to scanout 0, 0 = blanked */
+
+	/* display */
+	int width;
+	int height;
+	const char *bind_addr;
+	int port;
+	uint32_t *fb;
+	struct smolrfb rfb;
+	/* Client fds already armed for SIGIO; see __smolkvm_virtio_gpu_poll() */
+	int armed[SMOLRFB_MAX_CLIENTS];
+};
+
+/* Defined at the end, once everything it points at exists */
+static struct __smolkvm_virtio_mmio __smolkvm_virtio_gpu_dev;
+
+static struct __smolkvm_virtio_gpu_priv __smolkvm_virtio_gpu_priv = {
+	.width = SMOLKVM_VIRTIO_GPU_WIDTH,
+	.height = SMOLKVM_VIRTIO_GPU_HEIGHT,
+	.port = SMOLKVM_VIRTIO_GPU_PORT,
+};
+
+/* -- resources and the scanout -- */
+
+static struct __smolkvm_virtio_gpu_resource *
+__smolkvm_virtio_gpu_find(struct __smolkvm_virtio_gpu_priv *g, uint32_t id)
+{
+	unsigned int i;
+
+	/* Resource id 0 is reserved by the spec, so it marks a free slot */
+	if (!id)
+		return NULL;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(g->res); i++)
+		if (g->res[i].id == id)
+			return &g->res[i];
+
+	return NULL;
+}
+
+static void __smolkvm_virtio_gpu_free(struct __smolkvm_virtio_gpu_resource *res)
+{
+	free(res->backing);
+	memset(res, 0, sizeof(*res));
+}
+
+/*
+ * A forward-only reader over a resource's scattered guest backing. A transfer
+ * walks the rectangle top to bottom so the offsets only grow: remembering the
+ * entry the last row ended in turns a search per row into one pass.
+ */
+struct __smolkvm_virtio_gpu_reader {
+	const struct __smolkvm_virtio_gpu_resource *res;
+	uint32_t entry;		/* entry the cursor sits in */
+	uint64_t base;		/* resource offset where that entry starts */
+};
+
+static void __smolkvm_virtio_gpu_reader_init(struct __smolkvm_virtio_gpu_reader *r,
+					     const struct __smolkvm_virtio_gpu_resource *res)
+{
+	r->res = res;
+	r->entry = 0;
+	r->base = 0;
+}
+
+/* Copy `len` bytes from resource offset `off`, which must not go backwards */
+static int __smolkvm_virtio_gpu_reader_read(const struct smolkvm_vm *vm,
+					    struct __smolkvm_virtio_gpu_reader *r,
+					    uint64_t off, uint64_t len, void *dst)
+{
+	const struct __smolkvm_virtio_gpu_resource *res = r->res;
+	uint8_t *out = dst;
+
+	if (off < r->base) {
+		r->entry = 0;
+		r->base = 0;
+	}
+
+	while (len) {
+		const struct __smolkvm_virtio_gpu_mem_entry *e;
+		uint64_t take;
+		void *src;
+
+		if (r->entry >= res->nr_entries)
+			return -1;
+
+		e = &res->backing[r->entry];
+
+		if (off >= r->base + e->length) {
+			r->base += e->length;
+			r->entry++;
+			continue;
+		}
+
+		take = r->base + e->length - off;
+		if (take > len)
+			take = len;
+
+		src = __smolkvm_memory_ptr(vm, e->addr + (off - r->base), take);
+		if (!src)
+			return -1;
+
+		memcpy(out, src, take);
+		out += take;
+		off += take;
+		len -= take;
+	}
+
+	return 0;
+}
+
+/*
+ * Pull a rectangle of the resource bound to the scanout into our framebuffer.
+ * `offset` is where the rectangle's first pixel lives in the resource and the
+ * rows are the resource's width apart. Anything outside the resource or the
+ * display is clipped rather than refused.
+ */
+static void __smolkvm_virtio_gpu_transfer(struct smolkvm_vm *vm,
+					  struct __smolkvm_virtio_gpu_priv *g,
+					  const struct __smolkvm_virtio_gpu_resource *res,
+					  const struct __smolkvm_virtio_gpu_rect *r,
+					  uint64_t offset)
+{
+	struct __smolkvm_virtio_gpu_reader reader;
+	uint32_t w = r->width;
+	uint32_t h = r->height;
+	uint32_t row;
+
+	if (r->x >= (uint32_t) g->width || r->y >= (uint32_t) g->height)
+		return;
+	if (r->x >= res->width || r->y >= res->height)
+		return;
+
+	if (w > res->width - r->x)
+		w = res->width - r->x;
+	if (h > res->height - r->y)
+		h = res->height - r->y;
+	if (w > (uint32_t) g->width - r->x)
+		w = (uint32_t) g->width - r->x;
+	if (h > (uint32_t) g->height - r->y)
+		h = (uint32_t) g->height - r->y;
+
+	__smolkvm_virtio_gpu_reader_init(&reader, res);
+
+	for (row = 0; row < h; row++) {
+		uint64_t src = offset + (uint64_t) row * res->width * 4;
+		uint32_t *dst = g->fb + (uint64_t) (r->y + row) * g->width + r->x;
+
+		if (__smolkvm_virtio_gpu_reader_read(vm, &reader, src, w * 4, dst)) {
+			__smolkvm_debug("virtio-gpu: transfer ran off the backing "
+					"at row %u\n", row);
+			return;
+		}
+	}
+}
+
+/* -- the RFB side -- */
+
+/*
+ * smolrfb accepts its own clients, so there is no hook to arm a new one for
+ * SIGIO -- and without that an idle (HLTed) guest never leaves KVM_RUN, so a
+ * viewer that connects, or asks for a frame, waits for the guest to exit for
+ * some other reason. Walking the client table after each poll is cheap.
+ */
+static void __smolkvm_virtio_gpu_arm_clients(struct __smolkvm_virtio_gpu_priv *g)
+{
+	int i;
+
+	for (i = 0; i < SMOLRFB_MAX_CLIENTS; i++) {
+		int fd = g->rfb.cl[i].fd;
+
+		if (fd < 0) {
+			g->armed[i] = -1;
+			continue;
+		}
+
+		if (g->armed[i] == fd)
+			continue;
+
+		__smolkvm_make_socket_trigger_sigio(fd);
+		g->armed[i] = fd;
+	}
+}
+
+static void __smolkvm_virtio_gpu_poll(struct smolkvm_vm *vm, struct smolkvm_mmio *mmio)
+{
+	/* mmio->priv is the transport; the device hangs off that */
+	struct __smolkvm_virtio_mmio *dev = mmio->priv;
+	struct __smolkvm_virtio_gpu_priv *g = dev->priv;
+
+	smolrfb_poll(&g->rfb, 0);
+	__smolkvm_virtio_gpu_arm_clients(g);
+}
+
+/* -- the control queue -- */
+
+static uint32_t __smolkvm_virtio_gpu_create_2d(struct __smolkvm_virtio_gpu_priv *g,
+			const struct __smolkvm_virtio_gpu_resource_create_2d *cmd)
+{
+	struct __smolkvm_virtio_gpu_resource *res;
+	unsigned int i;
+
+	if (!cmd->resource_id || !cmd->width || !cmd->height)
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+	if (cmd->format != __SMOLKVM_VIRTIO_GPU_FORMAT_B8G8R8X8 &&
+	    cmd->format != __SMOLKVM_VIRTIO_GPU_FORMAT_B8G8R8A8) {
+		printf("virtio-gpu: resource format %u is not one of the two "
+		       "32-bit layouts this understands\n", cmd->format);
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+	}
+
+	if (__smolkvm_virtio_gpu_find(g, cmd->resource_id))
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(g->res); i++) {
+		res = &g->res[i];
+
+		if (res->id)
+			continue;
+
+		res->id = cmd->resource_id;
+		res->format = cmd->format;
+		res->width = cmd->width;
+		res->height = cmd->height;
+		res->backing = NULL;
+		res->nr_entries = 0;
+
+		__smolkvm_debug("virtio-gpu: resource %u is %ux%u, format %u\n",
+				res->id, res->width, res->height, res->format);
+
+		return __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA;
+	}
+
+	printf("virtio-gpu: no free resource slots (%u in use)\n",
+	       (unsigned int) SMOLKVM_ARRAYSIZE(g->res));
+
+	return __SMOLKVM_VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+}
+
+static uint32_t __smolkvm_virtio_gpu_attach_backing_cmd(struct smolkvm_vm *vm,
+			struct __smolkvm_virtio_gpu_priv *g,
+			struct __smolkvm_virtq_chain *chain,
+			const struct __smolkvm_virtio_gpu_attach_backing *cmd)
+{
+	struct __smolkvm_virtio_gpu_mem_entry *entries;
+	struct __smolkvm_virtio_gpu_resource *res;
+	size_t bytes;
+
+	res = __smolkvm_virtio_gpu_find(g, cmd->resource_id);
+	if (!res)
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+
+	if (!cmd->nr_entries || cmd->nr_entries > SMOLKVM_VIRTIO_GPU_BACKING_MAX) {
+		printf("virtio-gpu: backing of %u entries is not sane\n",
+		       cmd->nr_entries);
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+	}
+
+	bytes = (size_t) cmd->nr_entries * sizeof(*entries);
+
+	entries = malloc(bytes);
+	if (!entries)
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+
+	/* The entry list follows the command in the same chain */
+	if (__smolkvm_virtq_chain_read(vm, chain, entries, bytes) != bytes) {
+		free(entries);
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+	}
+
+	free(res->backing);
+	res->backing = entries;
+	res->nr_entries = cmd->nr_entries;
+
+	__smolkvm_debug("virtio-gpu: resource %u backed by %u entries\n",
+			res->id, res->nr_entries);
+
+	return __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+static uint32_t __smolkvm_virtio_gpu_set_scanout(struct smolkvm_vm *vm,
+			struct __smolkvm_virtio_gpu_priv *g,
+			const struct __smolkvm_virtio_gpu_set_scanout *cmd)
+{
+	struct __smolkvm_virtio_gpu_rect whole;
+	struct __smolkvm_virtio_gpu_resource *res;
+
+	if (cmd->scanout_id != 0)
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
+
+	/* Resource 0 means "nothing on this scanout": blank it */
+	if (!cmd->resource_id) {
+		g->scanout_res = 0;
+		memset(g->fb, 0, (size_t) g->width * g->height * 4);
+		smolrfb_damage_all(&g->rfb);
+		return __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA;
+	}
+
+	res = __smolkvm_virtio_gpu_find(g, cmd->resource_id);
+	if (!res)
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+
+	g->scanout_res = res->id;
+
+	/*
+	 * The driver transfers a new framebuffer *before* it binds it, so the
+	 * pixels of the first frame after a modeset arrived while this resource
+	 * was still nobody's scanout and were dropped. Pull the whole resource
+	 * in now and that frame is right after all.
+	 */
+	whole.x = 0;
+	whole.y = 0;
+	whole.width = res->width;
+	whole.height = res->height;
+
+	if (res->nr_entries)
+		__smolkvm_virtio_gpu_transfer(vm, g, res, &whole, 0);
+
+	smolrfb_damage_all(&g->rfb);
+
+	__smolkvm_debug("virtio-gpu: scanout 0 shows resource %u\n", res->id);
+
+	return __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+static uint32_t __smolkvm_virtio_gpu_flush(struct __smolkvm_virtio_gpu_priv *g,
+			const struct __smolkvm_virtio_gpu_resource_flush *cmd)
+{
+	int x = (int) cmd->r.x;
+	int y = (int) cmd->r.y;
+	int w = (int) cmd->r.width;
+	int h = (int) cmd->r.height;
+
+	if (!__smolkvm_virtio_gpu_find(g, cmd->resource_id))
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+
+	/* Only what is on screen is worth telling the viewers about */
+	if (cmd->resource_id != g->scanout_res)
+		return __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA;
+
+	if (x > g->width || y > g->height)
+		return __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA;
+
+	if (w > g->width - x)
+		w = g->width - x;
+	if (h > g->height - y)
+		h = g->height - y;
+
+	smolrfb_damage(&g->rfb, x, y, w, h);
+
+	return __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA;
+}
+
+/*
+ * Run one control queue request. The response is always a ctrl_hdr, sometimes
+ * with a body behind it, so the type is decided here and written out by the
+ * caller along with the fence the request may have carried.
+ */
+static uint32_t __smolkvm_virtio_gpu_command(struct smolkvm_vm *vm,
+			struct __smolkvm_virtio_gpu_priv *g,
+			struct __smolkvm_virtq_chain *chain,
+			const struct __smolkvm_virtio_gpu_ctrl_hdr *hdr,
+			void *body, size_t *body_len)
+{
+	union {
+		struct __smolkvm_virtio_gpu_resource_create_2d create_2d;
+		struct __smolkvm_virtio_gpu_resource_unref unref;
+		struct __smolkvm_virtio_gpu_set_scanout set_scanout;
+		struct __smolkvm_virtio_gpu_resource_flush flush;
+		struct __smolkvm_virtio_gpu_transfer_to_host_2d transfer;
+		struct __smolkvm_virtio_gpu_attach_backing attach;
+	} cmd;
+	struct __smolkvm_virtio_gpu_resource *res;
+	size_t need;
+
+	*body_len = 0;
+
+	switch (hdr->type) {
+	case __SMOLKVM_VIRTIO_GPU_CMD_GET_DISPLAY_INFO: {
+		struct __smolkvm_virtio_gpu_display_one *pmodes = body;
+
+		/* One scanout, one mode, always connected */
+		memset(pmodes, 0, sizeof(struct __smolkvm_virtio_gpu_display_one)
+				  * __SMOLKVM_VIRTIO_GPU_MAX_SCANOUTS);
+		pmodes[0].r.width = (uint32_t) g->width;
+		pmodes[0].r.height = (uint32_t) g->height;
+		pmodes[0].enabled = 1;
+
+		*body_len = sizeof(struct __smolkvm_virtio_gpu_display_one)
+			    * __SMOLKVM_VIRTIO_GPU_MAX_SCANOUTS;
+
+		return __SMOLKVM_VIRTIO_GPU_RESP_OK_DISPLAY_INFO;
+	}
+
+	case __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:
+		need = sizeof(cmd.create_2d);
+		break;
+	case __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_UNREF:
+		need = sizeof(cmd.unref);
+		break;
+	case __SMOLKVM_VIRTIO_GPU_CMD_SET_SCANOUT:
+		need = sizeof(cmd.set_scanout);
+		break;
+	case __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_FLUSH:
+		need = sizeof(cmd.flush);
+		break;
+	case __SMOLKVM_VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:
+		need = sizeof(cmd.transfer);
+		break;
+	case __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING:
+		need = sizeof(cmd.attach);
+		break;
+	case __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING:
+		need = sizeof(cmd.unref);
+		break;
+	default:
+		/* 3D, blob, EDID and capsets: never offered, so never expected */
+		printf("virtio-gpu: command 0x%x is not implemented\n", hdr->type);
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_UNSPEC;
+	}
+
+	if (__smolkvm_virtq_chain_read(vm, chain, &cmd, need) != need)
+		return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+
+	switch (hdr->type) {
+	case __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:
+		return __smolkvm_virtio_gpu_create_2d(g, &cmd.create_2d);
+
+	case __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_UNREF:
+	case __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING:
+		res = __smolkvm_virtio_gpu_find(g, cmd.unref.resource_id);
+		if (!res)
+			return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+
+		if (hdr->type == __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_UNREF) {
+			if (res->id == g->scanout_res)
+				g->scanout_res = 0;
+			__smolkvm_virtio_gpu_free(res);
+		} else {
+			free(res->backing);
+			res->backing = NULL;
+			res->nr_entries = 0;
+		}
+
+		return __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA;
+
+	case __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING:
+		return __smolkvm_virtio_gpu_attach_backing_cmd(vm, g, chain, &cmd.attach);
+
+	case __SMOLKVM_VIRTIO_GPU_CMD_SET_SCANOUT:
+		return __smolkvm_virtio_gpu_set_scanout(vm, g, &cmd.set_scanout);
+
+	case __SMOLKVM_VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:
+		res = __smolkvm_virtio_gpu_find(g, cmd.transfer.resource_id);
+		if (!res)
+			return __SMOLKVM_VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+
+		/*
+		 * Nothing is kept for a resource that is not on screen. Binding
+		 * one to the scanout copies all of it in, so dropping this is
+		 * invisible rather than merely cheap.
+		 */
+		if (res->id == g->scanout_res && res->nr_entries)
+			__smolkvm_virtio_gpu_transfer(vm, g, res, &cmd.transfer.r,
+						      cmd.transfer.offset);
+
+		return __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA;
+
+	case __SMOLKVM_VIRTIO_GPU_CMD_RESOURCE_FLUSH:
+		return __smolkvm_virtio_gpu_flush(g, &cmd.flush);
+	}
+
+	return __SMOLKVM_VIRTIO_GPU_RESP_ERR_UNSPEC;
+}
+
+static void __smolkvm_virtio_gpu_ctrl_queue(struct smolkvm_vm *vm,
+					    struct __smolkvm_virtio_gpu_priv *g)
+{
+	struct __smolkvm_virtq *vq = &g->vq[__SMOLKVM_VIRTIO_GPU_QUEUE_CTRL];
+	struct __smolkvm_virtq_chain chain;
+	bool notify = false;
+
+	while (__smolkvm_virtq_pop(vm, vq, &chain)) {
+		/* Big enough for the largest response body, the display info */
+		struct __smolkvm_virtio_gpu_resp_display_info resp;
+		struct __smolkvm_virtio_gpu_ctrl_hdr hdr;
+		size_t body_len = 0;
+
+		notify = true;
+
+		memset(&resp, 0, sizeof(resp));
+
+		if (__smolkvm_virtq_chain_read(vm, &chain, &hdr, sizeof(hdr))
+		    != sizeof(hdr)) {
+			resp.hdr.type = __SMOLKVM_VIRTIO_GPU_RESP_ERR_UNSPEC;
+		} else {
+			resp.hdr.type = __smolkvm_virtio_gpu_command(vm, g, &chain,
+					&hdr, resp.pmodes, &body_len);
+
+			/*
+			 * A fenced request is only finished once the driver sees
+			 * its id come back, so echo it or the guest waits for a
+			 * frame that has already been drawn.
+			 */
+			if (hdr.flags & __SMOLKVM_VIRTIO_GPU_FLAG_FENCE) {
+				resp.hdr.flags = __SMOLKVM_VIRTIO_GPU_FLAG_FENCE;
+				resp.hdr.fence_id = hdr.fence_id;
+			}
+		}
+
+		__smolkvm_virtq_chain_write(vm, &chain, &resp,
+					    sizeof(resp.hdr) + body_len);
+		__smolkvm_virtq_push(vm, vq, &chain);
+	}
+
+	if (notify)
+		__smolkvm_virtio_signal_used(vm, &__smolkvm_virtio_gpu_dev);
+}
+
+/*
+ * The cursor queue. Nothing is drawn (a viewer has its own pointer), but the
+ * requests still have to come back or the driver runs out of buffers.
+ */
+static void __smolkvm_virtio_gpu_cursor_queue(struct smolkvm_vm *vm,
+					      struct __smolkvm_virtio_gpu_priv *g)
+{
+	struct __smolkvm_virtq *vq = &g->vq[__SMOLKVM_VIRTIO_GPU_QUEUE_CURSOR];
+	struct __smolkvm_virtq_chain chain;
+	bool notify = false;
+
+	while (__smolkvm_virtq_pop(vm, vq, &chain)) {
+		struct __smolkvm_virtio_gpu_ctrl_hdr resp = { 0 };
+
+		notify = true;
+
+		resp.type = __SMOLKVM_VIRTIO_GPU_RESP_OK_NODATA;
+
+		/* The driver adds no writable descriptor here; this finds none */
+		__smolkvm_virtq_chain_write(vm, &chain, &resp, sizeof(resp));
+		__smolkvm_virtq_push(vm, vq, &chain);
+	}
+
+	if (notify)
+		__smolkvm_virtio_signal_used(vm, &__smolkvm_virtio_gpu_dev);
+}
+
+/* -- the device on the transport -- */
+
+/*
+ * A reset drops everything the guest owned: its resources and the scanout it
+ * had bound. The display stays up; a viewer should survive a guest reboot.
+ */
+static void __smolkvm_virtio_gpu_dev_reset(struct smolkvm_vm *vm,
+					   struct __smolkvm_virtio_mmio *dev)
+{
+	struct __smolkvm_virtio_gpu_priv *g = dev->priv;
+	unsigned int i;
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(g->res); i++)
+		if (g->res[i].id)
+			__smolkvm_virtio_gpu_free(&g->res[i]);
+
+	g->scanout_res = 0;
+}
+
+static void __smolkvm_virtio_gpu_notify(struct smolkvm_vm *vm,
+					struct __smolkvm_virtio_mmio *dev,
+					uint32_t queue)
+{
+	struct __smolkvm_virtio_gpu_priv *g = dev->priv;
+
+	if (queue == __SMOLKVM_VIRTIO_GPU_QUEUE_CTRL)
+		__smolkvm_virtio_gpu_ctrl_queue(vm, g);
+	else if (queue == __SMOLKVM_VIRTIO_GPU_QUEUE_CURSOR)
+		__smolkvm_virtio_gpu_cursor_queue(vm, g);
+}
+
+static struct __smolkvm_virtio_mmio __smolkvm_virtio_gpu_dev = {
+	.device_id = __SMOLKVM_VIRTIO_ID_GPU,
+	.device_features = __SMOLKVM_VIRTIO_F_VERSION_1,
+	.irq = SMOLKVM_VIRTIO_GPU_IRQ,
+	.vq = __smolkvm_virtio_gpu_priv.vq,
+	.num_vq = __SMOLKVM_VIRTIO_GPU_QUEUES_NUM,
+	.queue_sz = SMOLKVM_VIRTIO_GPU_QUEUE_SZ,
+	.config = &__smolkvm_virtio_gpu_priv.config,
+	.config_len = sizeof(__smolkvm_virtio_gpu_priv.config),
+	.notify = __smolkvm_virtio_gpu_notify,
+	.reset = __smolkvm_virtio_gpu_dev_reset,
+	.priv = &__smolkvm_virtio_gpu_priv,
+};
+
+static struct smolkvm_mmio __smolkvm_virtio_gpu = {
+	.name = "virtio-gpu",
+	.phys = SMOLKVM_VIRTIO_GPU_PHYS,
+	.len = SMOLKVM_VIRTIO_GPU_LEN,
+	.regs = __smolkvm_virtio_mmio_regs,
+	.num_regs = SMOLKVM_ARRAYSIZE(__smolkvm_virtio_mmio_regs),
+	.pre_run = __smolkvm_virtio_gpu_poll,
+	.write = __smolkvm_virtio_mmio_write,
+	.read = __smolkvm_virtio_mmio_read,
+	.priv = &__smolkvm_virtio_gpu_dev,
+};
+
+/*
+ * Pick the display size and where the RFB server listens. Call before
+ * smolkvm_create_vm(); after it the size is baked into what the guest has
+ * been told, and there is no resize in the protocol as used here.
+ *
+ * `bind_addr` is a dotted quad, or NULL for loopback -- there is no
+ * authentication in smolrfb, so anything else wants an ssh tunnel in front.
+ */
+void smolkvm_virtio_gpu_configure(int width, int height,
+				  const char *bind_addr, int port)
+{
+	struct __smolkvm_virtio_gpu_priv *g = &__smolkvm_virtio_gpu_priv;
+
+	g->width = width;
+	g->height = height;
+	g->bind_addr = bind_addr;
+	g->port = port;
+}
+
+/*
+ * The `virtio_mmio.device=` fragments that point Linux at every virtio device
+ * here; append them to the guest command line. With no PCI and no device tree
+ * this is the only way the guest hears about them. One fragment per device,
+ * so the caller does not have to know how many there are.
+ */
+const char *smolkvm_virtio_cmdline(void)
+{
+	static char fragment[192];
+
+	snprintf(fragment, sizeof(fragment),
+		     "virtio_mmio.device=0x%llx@0x%llx:%d",
+		     (unsigned long long) SMOLKVM_VIRTIO_GPU_LEN,
+		     (unsigned long long) SMOLKVM_VIRTIO_GPU_PHYS,
+		     SMOLKVM_VIRTIO_GPU_IRQ);
+
+	return fragment;
+}
+
+static inline int __smolkvm_virtio_gpu_create(struct smolkvm_vm *vm)
+{
+	struct __smolkvm_virtio_gpu_priv *g = &__smolkvm_virtio_gpu_priv;
+	/* No input device built in: smolrfb's key/pointer events go nowhere */
+	const struct smolrfb_input *input = NULL;
+	size_t fb_bytes;
+	int ret;
+	int i;
+
+	if (g->width <= 0 || g->height <= 0) {
+		printf("virtio-gpu: %dx%d is not a display\n", g->width, g->height);
+		return -1;
+	}
+
+	fb_bytes = (size_t) g->width * g->height * 4;
+
+	g->fb = malloc(fb_bytes);
+	if (!g->fb) {
+		printf("virtio-gpu: could not allocate a %dx%d framebuffer\n",
+		       g->width, g->height);
+		return -1;
+	}
+	memset(g->fb, 0, fb_bytes);
+
+	for (i = 0; i < SMOLRFB_MAX_CLIENTS; i++)
+		g->armed[i] = -1;
+
+	/* One scanout, no capsets, no blobs: the 2D device and nothing else */
+	g->config.num_scanouts = 1;
+
+	ret = smolrfb_open(&g->rfb, g->bind_addr, g->port, g->width, g->height,
+			   "smolkvm", input);
+	if (ret) {
+		printf("virtio-gpu: could not listen on port %d: %d\n", g->port, ret);
+		free(g->fb);
+		g->fb = NULL;
+		return -1;
+	}
+
+	smolrfb_framebuffer(&g->rfb, g->fb);
+	__smolkvm_make_socket_trigger_sigio(g->rfb.listen_fd);
+
+	printf("virtio-gpu: %dx%d, VNC on %s:%d\n", g->width, g->height,
+	       g->bind_addr ? g->bind_addr : "127.0.0.1", g->port);
+	printf("virtio: append \"%s\" to the guest command line\n",
+	       smolkvm_virtio_cmdline());
+
+	return __smolkvm_plugin_mmio(vm, &__smolkvm_virtio_gpu);
+}
+
+#endif /* SMOLKVM_WANT_VIRTIO_GPU */
+#endif
+/* -- */
+
 /* ELF loading */
 #ifdef SMOLKVM_FOLD
 
@@ -3939,6 +4852,17 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 	__smolkvm_timer_create(vm);
 #endif
 
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+	/*
+	 * Plug in the display. This one is allowed to fail the whole VM: if it
+	 * did not, the guest would be pointed at a register window nothing
+	 * answers and the first access would stop the machine anyway.
+	 */
+	ret = __smolkvm_virtio_gpu_create(vm);
+	if (ret)
+		return -SMOLKVM_ERR_CREATE_VIRTIO_GPU;
+#endif
+
 	return 0;
 }
 
@@ -3963,12 +4887,19 @@ void smolkvm_dump_register_header_novm(FILE *out)
 	__smolkvm_plugin_mmio(&vm, &__smolkvm_irqchip);
 	__smolkvm_plugin_mmio(&vm, &__smolkvm_timer);
 #endif
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+	__smolkvm_plugin_mmio(&vm, &__smolkvm_virtio_gpu);
+#endif
 
 	smolkvm_dump_register_header(&vm, out);
 }
 
 void smolkvm_destroy_vm(struct smolkvm_vm *vm)
 {
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+	/* Drop the viewers and the port before the fds go */
+	smolrfb_close(&__smolkvm_virtio_gpu_priv.rfb);
+#endif
 	munmap(vm->vcpu_run, vm->vcpu_run_sz);
 	close(vm->vcpu_fd);
 	close(vm->vm_fd);

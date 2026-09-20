@@ -22,6 +22,7 @@ This is a single header implementation of a very crappy "virtual machine".
   guests) and APIC (KVM's in-kernel APIC/IOAPIC/PIC/PIT + a legacy COM1
   UART, boots stock Linux).
 - meh grade gdb stub.
+- Optional virtio-gpu, scanned out to VNC viewers by smolrfb. See below.
 - lots of bugs
 - Compiles to a completely self standing static binary with nolibc: pass
   both `NOLIBCDIR` (your nolibc, e.g. `tools/include/nolibc` in the linux
@@ -52,3 +53,39 @@ make
 `-m` sets the RAM size in MB (default 64). The kernel needs
 `CONFIG_SERIAL_8250_CONSOLE=y`; there is no PCI, no disk and no network,
 so an initramfs is the only way to get userspace.
+
+## A display
+
+`SMOLKVM_WANT_VIRTIO_GPU` adds a virtio-gpu, and
+[smolrfb](https://github.com/fifteenhex/smolrfb) serves its scanout to VNC
+viewers. It is off unless asked for, and needs the APIC machine (the driver
+wants a real interrupt) plus a smolrfb checkout to include:
+
+```
+make SMOLRFBDIR=/path/to/smolrfb
+./smolkvm_test_apic_gpu_libc -k vmlinux -r initramfs.cpio.gz \
+	-c "console=tty0 console=ttyS0" -g 1280x800 -p 5900
+```
+
+and point a VNC viewer at `127.0.0.1:5900`. `console=tty0` is what puts the
+kernel log on the display; without it you get the boot logo on black and no way
+to tell a working display from a stuck one. Note also that Linux stops reading
+its own parameters at a standalone `--`, so anything after that goes to init
+rather than the kernel -- smolkvm puts its own `virtio_mmio.device=` in front of
+one for you.
+
+`-g` sets the display size and `-p` the port; both default to 1024x768 on 5900.
+The server binds loopback only -- there is no authentication in smolrfb, so
+reach it from elsewhere over an ssh tunnel.
+
+The transport is virtio-mmio rather than virtio-pci, because there is no PCI
+here. That means nothing enumerates the device: the guest is told where it is
+on the kernel command line, and `smolkvm_test` appends the right
+`virtio_mmio.device=...` fragment for you (it is printed at startup if you are
+building your own command line). The guest kernel needs
+`CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` -- without it nothing parses the
+fragment and no device appears -- along with `CONFIG_DRM_VIRTIO_GPU`,
+`CONFIG_DRM_FBDEV_EMULATION` and the VT layer if you want a console on it.
+There is no config fragment for that here yet, so turn those on by hand.
+
+The device is 2D only: no virgl, no blob resources, no EDID.

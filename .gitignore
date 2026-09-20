@@ -9,6 +9,11 @@
 /smolkvm_test_apic_debug_libc
 /smolkvm_test_apic_gdb_libc
 /smolkvm_test_apic_debug_gdb_libc
+/smolkvm_test_gpu
+/smolkvm_test_apic_gpu_libc
+/smolkvm_test_apic_gpu_debug_libc
+/smolkvm_test_apic_gpu_gdb_libc
+/smolkvm_test_apic_gpu_debug_gdb_libc
 
 # Everything Makefile.test downloads, unpacks, clones or builds. Deleting this
 # is always safe; the config fragments it needs are checked in under test/.

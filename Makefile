@@ -14,12 +14,21 @@ HDR := smolkvm.h
 
 DEBUG_FLAGS := -DSMOLKVM_DEBUG
 GDB_FLAGS   := -DSMOLKVM_WANT_GDB_STUB -DSMOLKVM_WANT_GDB_STUB_DEBUG
+GPU_FLAGS   := -DSMOLKVM_WANT_VIRTIO_GPU -I$(SMOLRFBDIR)
 
 VARIANTS := _libc _debug_libc _gdb_libc _debug_gdb_libc
 
 SIMPLE_TARGETS := $(addprefix smolkvm_test_simple,$(VARIANTS))
 APIC_TARGETS   := $(addprefix smolkvm_test_apic,$(VARIANTS))
 ALL_TARGETS    := $(SIMPLE_TARGETS) $(APIC_TARGETS)
+
+# The virtio-gpu needs smolrfb, which lives in its own repo, so its targets only
+# exist once you say where that is. Only the APIC machine can have one: the
+# driver wants a real interrupt.
+ifdef SMOLRFBDIR
+GPU_TARGETS    := $(addprefix smolkvm_test_apic_gpu,$(VARIANTS))
+ALL_TARGETS    += $(GPU_TARGETS)
+endif
 
 # The generated header describes the APIC machine (that is what the IPL boots),
 # so it is dumped by the plain APIC build.
@@ -29,9 +38,11 @@ all: $(ALL_TARGETS) $(IPL)
 
 $(SIMPLE_TARGETS): MACHINETYPE := -DSMOLKVM_WANT_SIMPLE
 $(APIC_TARGETS):   MACHINETYPE := -DSMOLKVM_WANT_APIC
+$(GPU_TARGETS):    MACHINETYPE := -DSMOLKVM_WANT_APIC
 
 $(filter %_debug_libc %_debug_gdb_libc,$(ALL_TARGETS)): EXTRA_FLAGS += $(DEBUG_FLAGS)
 $(filter %_gdb_libc,$(ALL_TARGETS)):                    EXTRA_FLAGS += $(GDB_FLAGS)
+$(GPU_TARGETS):                                         EXTRA_FLAGS += $(GPU_FLAGS)
 
 $(ALL_TARGETS): $(SRC) $(HDR)
 	$(CC) $(COPTS) $(MACHINETYPE) $(EXTRA_FLAGS) -o $@ $(SRC)
@@ -63,6 +74,15 @@ smolkvm_test: smolkvm_test.c smolkvm.h $(IPL)
 # -DSMOLKVM_WANT_GDB_STUB_DEBUG
 smolkvm_test_gdb: smolkvm_test.c smolkvm.h $(IPL)
 	$(CC) -DSMOLKVM_WANT_APIC -DSMOLKVM_WANT_GDB_STUB -nostdlib $(NOLIBC_INC) $(COPTS) -static -o $@ $< -lgcc
+
+# smolrfb builds with nolibc too, so the machine with a display is still a
+# single static binary.
+ifdef SMOLRFBDIR
+all: smolkvm_test_gpu
+
+smolkvm_test_gpu: smolkvm_test.c smolkvm.h $(IPL)
+	$(CC) -DSMOLKVM_WANT_APIC $(GPU_FLAGS) -nostdlib $(NOLIBC_INC) $(COPTS) -static -o $@ $< -lgcc
+endif
 endif
 else
 $(warning Please pass NOLIBCDIR with the path to your copy of nolibc (tools/include/nolibc/ in the linux source) for static targets)
@@ -70,6 +90,6 @@ endif
 
 .PHONY: clean
 clean:
-	rm -f $(ALL_TARGETS) smolkvm_test smolkvm_test_gdb
+	rm -f $(ALL_TARGETS) smolkvm_test smolkvm_test_gdb smolkvm_test_gpu
 	rm -f ipl/include/machine.h
 	$(MAKE) -C ipl/ clean 2>/dev/null || true

@@ -119,6 +119,70 @@ static uint64_t load_kernel_fn(struct smolkvm_vm *vm, uint64_t command, void *bu
 	return 0;
 }
 
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+/* "1024x768" -> 1024, 768. Returns 0 on success. */
+static int parse_display_size(const char *str, int *width, int *height)
+{
+	const char *x = strchr(str, 'x');
+
+	if (!x || x == str || !x[1])
+		return -1;
+
+	*width = atoi(str);
+	*height = atoi(x + 1);
+
+	if (*width <= 0 || *height <= 0)
+		return -1;
+
+	return 0;
+}
+
+/*
+ * Length of the command line up to a standalone "--", or the whole thing if
+ * there is not one. Linux stops reading its own parameters at "--" and hands
+ * everything after it to init, so a fragment tacked on the end of a command
+ * line that has one is passed to init as an argument and the kernel never
+ * sees it. It has to go in front.
+ */
+static size_t cmdline_kernel_len(const char *cmdline)
+{
+	size_t i;
+
+	for (i = 0; cmdline[i]; i++) {
+		/* Only a "--" on its own is the separator, not one inside a word */
+		if (cmdline[i] != '-' || cmdline[i + 1] != '-')
+			continue;
+		if (i && cmdline[i - 1] != ' ')
+			continue;
+		if (cmdline[i + 2] && cmdline[i + 2] != ' ')
+			continue;
+
+		return i;
+	}
+
+	return i;
+}
+
+/*
+ * The guest only learns the virtio devices exist from the command line, so
+ * glue their description of themselves onto whatever was asked for rather than
+ * making every caller remember a pile of addresses.
+ */
+static const char *cmdline_with_virtio(const char *cmdline)
+{
+	static char full[512];
+	size_t kernel_len = cmdline_kernel_len(cmdline);
+
+	snprintf(full, sizeof(full), "%.*s%s%s %s",
+		 (int) kernel_len, cmdline,
+		 kernel_len ? " " : "",
+		 smolkvm_virtio_cmdline(),
+		 cmdline + kernel_len);
+
+	return full;
+}
+#endif
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
@@ -127,8 +191,17 @@ static void usage(const char *argv0)
 		"  -r  initrd/initramfs image, loaded at the top of RAM\n"
 		"  -c  kernel command line (default: \"%s\")\n"
 		"  -m  system RAM size in MB (default: %d)\n"
-		"  -h  dump the generated machine header to a file and exit\n",
-		argv0, DEFAULT_CMDLINE, DEFAULT_RAM_MB);
+		"  -h  dump the generated machine header to a file and exit\n"
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+		"  -g  display size as WIDTHxHEIGHT (default: %dx%d)\n"
+		"  -p  port for the VNC server, on loopback (default: %d)\n"
+#endif
+		, argv0, DEFAULT_CMDLINE, DEFAULT_RAM_MB
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+		, SMOLKVM_VIRTIO_GPU_WIDTH, SMOLKVM_VIRTIO_GPU_HEIGHT,
+		SMOLKVM_VIRTIO_GPU_PORT
+#endif
+		);
 }
 
 int main(int argc, char **argv, char **envp)
@@ -144,14 +217,31 @@ int main(int argc, char **argv, char **envp)
 	const char *header_path = NULL;
 	struct smolkvm_vm vm = { 0 };
 	uint64_t ipl_entry = 0;
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+	int gpu_width = SMOLKVM_VIRTIO_GPU_WIDTH;
+	int gpu_height = SMOLKVM_VIRTIO_GPU_HEIGHT;
+	int gpu_port = SMOLKVM_VIRTIO_GPU_PORT;
+#endif
 	int ret;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "h:i:k:r:c:m:")) != -1) {
+	while ((opt = getopt(argc, argv, "h:i:k:r:c:m:g:p:")) != -1) {
 		switch (opt) {
 		case 'h':
 			header_path = optarg;
 			break;
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+		case 'g':
+			if (parse_display_size(optarg, &gpu_width, &gpu_height)) {
+				fprintf(stderr, "could not read \"%s\" as WIDTHxHEIGHT\n",
+					optarg);
+				return 1;
+			}
+			break;
+		case 'p':
+			gpu_port = atoi(optarg);
+			break;
+#endif
 		case 'i':
 			ipl_path = optarg;
 			break;
@@ -192,6 +282,12 @@ int main(int argc, char **argv, char **envp)
 		cfg.initrd_base = (cfg.ram_base + cfg.ram_sz - cfg.initrd_sz)
 				  & ~(SMOLKVM_SZ_4K - 1);
 	}
+
+#ifdef SMOLKVM_WANT_VIRTIO_GPU
+	/* Both of these have to be settled before the VM (and the display) exists */
+	smolkvm_virtio_gpu_configure(gpu_width, gpu_height, NULL, gpu_port);
+	cfg.cmdline = cmdline_with_virtio(cfg.cmdline);
+#endif
 
 	printf("Built %s @ %s\n", __DATE__, __TIME__);
 
