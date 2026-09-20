@@ -435,6 +435,26 @@ static inline int __smolkvm_handle_mmio(struct smolkvm_vm *vm)
 	return 0;
 }
 
+/*
+ * Port IO. Nothing is emulated: every port reads as 0xFF / swallows
+ * writes, which is what a PC with nothing on the bus looks like.
+ */
+static inline int __smolkvm_handle_io(struct smolkvm_vm *vm)
+{
+	struct kvm_run *run = vm->vcpu_run;
+	bool is_in = run->io.direction == KVM_EXIT_IO_IN;
+	uint8_t *data = (uint8_t *) run + run->io.data_offset;
+	uint32_t total = (uint32_t) run->io.size * run->io.count;
+
+	__smolkvm_debug("io %s port 0x%x, size %u, count %u\n",
+			is_in ? "in" : "out", run->io.port, run->io.size, run->io.count);
+
+	if (is_in)
+		memset(data, 0xFF, total);
+
+	return 0;
+}
+
 #endif
 /* -- */
 
