@@ -1,6 +1,8 @@
-# The pieces the smoke test is built out of: a Linux kernel and a smolutils
-# initramfs, both built from source into the build directory.
+# Smoke test: download a Linux kernel and smolutils, build a minimal vmlinux
+# with the shipped config, use smolutils as the initramfs, and boot the whole
+# lot under smolkvm -- passing if the guest reaches an interactive shell.
 #
+#   make -f Makefile.test smoke       # the whole pipeline, as a pass/fail
 #   make -f Makefile.test kernel      # just build vmlinux
 #   make -f Makefile.test initramfs   # just build the smolutils initramfs
 #   make -f Makefile.test clean       # drop build products, keep the downloads
@@ -65,6 +67,18 @@ SMOLUTILS_FEATURE_DISABLE := net
 
 INITRAMFS := $(CURDIR)/$(SMOLUTILS_SRC)/x86_64.cpio.gz
 
+# Built by the main Makefile.
+SMOLKVM := smolkvm_test_apic_libc
+IPL     := ipl/build/ipl
+
+SMOKE_TIMEOUT := 90
+# Everything after `--` is passed to smolutils' init (see its README).
+SMOKE_CMDLINE := console=ttyS0 earlycon=uart8250,io,0x3f8 -- smolinit.getty=/dev/ttyS0 smolinit.hostname=smolkvm
+SMOKE_LOG     := $(BUILDDIR)/smoke.log
+# smolsh prints "smolsh <cwd> > " once getty has a shell -- reaching it means we
+# booted all the way to an interactive userspace.
+SMOKE_MARKER  := smolsh
+
 NPROC := $(shell nproc 2>/dev/null || echo 1)
 
 # --- kernel source -----------------------------------------------------------
@@ -122,11 +136,42 @@ $(INITRAMFS): $(KERNEL_STAMP) $(TARWAK_BIN) | $(SMOLUTILS_SRC) $(NOLIBCEXT_SRC)
 initramfs: $(INITRAMFS)
 .PHONY: initramfs
 
+# --- the smoke test ----------------------------------------------------------
+
+# Build the smolkvm side via the main Makefile so we always test current code.
+smolkvm-bits:
+	$(MAKE) $(SMOLKVM) $(IPL)
+.PHONY: smolkvm-bits
+
+# Boot in the background and stop the moment the marker appears. SMOKE_TIMEOUT
+# is only the failure cap.
+smoke: $(VMLINUX) $(INITRAMFS) smolkvm-bits
+	@echo "=== booting $(KERNEL_SRC) + smolutils under smolkvm ==="
+	@rm -f $(SMOKE_LOG)
+	@./$(SMOLKVM) -k $(VMLINUX) -r $(INITRAMFS) -c "$(SMOKE_CMDLINE)" \
+		> $(SMOKE_LOG) 2>&1 & \
+	pid=$$!; \
+	ok=0; \
+	for i in $$(seq 1 $(SMOKE_TIMEOUT)); do \
+		if grep -q "$(SMOKE_MARKER)" $(SMOKE_LOG) 2>/dev/null; then ok=1; break; fi; \
+		kill -0 $$pid 2>/dev/null || break; \
+		sleep 1; \
+	done; \
+	kill $$pid 2>/dev/null; wait $$pid 2>/dev/null; \
+	if [ $$ok = 1 ]; then \
+		echo "SMOKE PASS (reached an interactive shell)"; \
+	else \
+		echo "SMOKE FAIL -- last lines of $(SMOKE_LOG):"; \
+		tail -n 20 $(SMOKE_LOG); \
+		exit 1; \
+	fi
+.PHONY: smoke
+
 # --- cleanup -----------------------------------------------------------------
 
 # Build products, but keep the downloaded/cloned sources.
 clean:
-	rm -rf $(KOUT)
+	rm -rf $(KOUT) $(SMOKE_LOG)
 	-$(MAKE) -C $(SMOLUTILS_SRC) -f Makefile.x86_64 \
 		NOLIBCDIR=$(NOLIBCDIR) NOLIBCEXTDIR=$(NOLIBCEXTDIR) \
 		CROSS_COMPILE=$(SMOLUTILS_CROSS) TARWAK=none clean 2>/dev/null
