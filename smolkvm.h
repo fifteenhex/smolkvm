@@ -261,7 +261,6 @@ struct smolkvm_mmio {
 	void *priv;
 };
 
-
 #ifdef SMOLKVM_WANT_GDB_STUB
 struct smolkvm_gdb_stub {
 	int listen_socket;
@@ -289,10 +288,10 @@ struct smolkvm_vm {
 	/* Running count only; per-slot occupancy (pointer != NULL) is authoritative */
 	unsigned int mmio_plugged_in;
 
-
 #ifdef SMOLKVM_WANT_GDB_STUB
 	struct smolkvm_gdb_stub gdb_stub;
 #endif
+
 	bool was_interrupted;
 };
 
@@ -1771,6 +1770,93 @@ static inline int __smolkvm_gdb_stub_process_packet_v(struct smolkvm_vm *vm,
 	return 0;
 }
 
+static inline int __smolkvm_gdb_stub_process_packet_continue(struct smolkvm_vm *vm)
+{
+	struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	gdb_stub->stopped = false;
+	gdb_stub->single_stepping = false;
+
+	/*
+	 * No reply here: the target is now *running*. The stop reply goes out
+	 * when it actually stops (see __smolkvm_gdb_stub_stop()); answering
+	 * S05 straight away makes GDB believe the target halted again.
+	 */
+	return 1;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_step(struct smolkvm_vm *vm)
+{
+	struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	gdb_stub->stopped = false;
+	gdb_stub->single_stepping = true;
+
+	/* As with continue: the stop reply is sent after the step happens */
+	return 1;
+}
+
+static inline void __smolkvm_gdb_stub_process_packet(struct smolkvm_vm *vm,
+						  struct smolkvm_gdb_stub_pkt *pkt)
+{
+	/*
+	 * <0 means there was an error,
+	 *  0 means the packet wasn't handled
+	 *  1 means the packet was handled
+	 */
+	int ret;
+
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("processing packet, type: %d\n", pkt->type);
+#endif
+
+	switch(pkt->type) {
+	case SMOLKVM_GDB_STUB_STOP_REASON:
+		ret = __smolkvm_gdb_stub_process_packet_stop_reason(vm);
+		break;
+	case SMOLKVM_GDB_STUB_READ_REGS:
+		ret = __smolkvm_gdb_stub_process_packet_read_regs(vm);
+		break;
+	case SMOLKVM_GDB_STUB_READ_MEM:
+		ret = __smolkvm_gdb_stub_process_packet_read_mem(vm, pkt);
+		break;
+	case SMOLKVM_GDB_STUB_CONTINUE:
+		ret = __smolkvm_gdb_stub_process_packet_continue(vm);
+		break;
+	case SMOLKVM_GDB_STUB_STEP:
+		ret = __smolkvm_gdb_stub_process_packet_step(vm);
+		break;
+	case SMOLKVM_GDB_STUB_QUERY:
+		ret = __smolkvm_gdb_stub_process_packet_query(vm, pkt);
+		break;
+	case SMOLKVM_GDB_STUB_H:
+		ret = __smolkvm_gdb_stub_process_packet_h(vm, pkt);
+		break;
+	case SMOLKVM_GDB_STUB_V:
+		ret = __smolkvm_gdb_stub_process_packet_v(vm, pkt);
+		break;
+	default:
+		ret = 0;
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+		printf("unhandled packet type\n");
+#endif
+		break;
+	}
+
+	if (ret < 0) {
+		printf("error handling packet: %d\n", ret);
+		return;
+	}
+
+	if (ret == 0)
+		__smolkvm_gdb_stub_send_packet(vm, NULL, 0);
+}
+
+/* The target just stopped (e.g. a single step completed): tell the debugger */
+static inline void __smolkvm_gdb_stub_stop(struct smolkvm_vm *vm)
+{
+	__smolkvm_gdb_stub_send_packet(vm, "S05", 3);
+}
 #endif /* SMOLKVM_WANT_GDB_STUB */
 #endif /* fold */
 
@@ -3123,13 +3209,42 @@ int smolkvm_run(struct smolkvm_vm *vm)
 	return 0;
 }
 
+int smolkvm_single_step(struct smolkvm_vm *vm, bool on)
+{
+	const struct kvm_guest_debug single_step_on = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+	};
+	const struct kvm_guest_debug single_step_off = {
+		.control = 0,
+	};
+	int ret;
+
+	ret = __smolkvm_set_guest_debug(vm, (on ? &single_step_on : &single_step_off));
+	if (ret)
+		return -1;
+
+	return 0;
+}
+
 static bool __smolkvm_stopped(const struct smolkvm_vm *vm)
 {
+#ifdef SMOLKVM_WANT_GDB_STUB
+	const struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	return gdb_stub->stopped;
+#else
 	return false;
+#endif
 }
 
 static void __smolkvm_stop(struct smolkvm_vm *vm)
 {
+#ifdef SMOLKVM_WANT_GDB_STUB
+	struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	gdb_stub->stopped = true;
+	__smolkvm_gdb_stub_stop(vm);
+#endif
 }
 
 static void __smolkvm_default_loop_pre_run(struct smolkvm_vm *vm)
@@ -3148,16 +3263,43 @@ static void __smolkvm_default_loop_pre_run(struct smolkvm_vm *vm)
 			(*mmio)->pre_run(vm, *mmio);
 	}
 
+#ifdef SMOLKVM_WANT_GDB_STUB
+	struct smolkvm_gdb_stub_pkt pkt;
+
+	int pktret = __smolkvm_gdb_stub_read_packet(vm, &pkt);
+	if (pktret == 1)
+		__smolkvm_gdb_stub_process_packet(vm, &pkt);
+	else if (pktret < 0) {
+		/* The debugger went away: let the guest run free */
+		printf("GDB disconnected, resuming\n");
+		close(vm->gdb_stub.conn_socket);
+		vm->gdb_stub.conn_socket = -1;
+		vm->gdb_stub.stopped = false;
+		vm->gdb_stub.single_stepping = false;
+	}
+#endif
 }
 
 static bool __smolkvm_is_single_stepping(struct smolkvm_vm *vm)
 {
+#ifdef SMOLKVM_WANT_GDB_STUB
+	const struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	return gdb_stub->single_stepping;
+#else
 	return false;
+#endif
 }
 
 static int __smolkvm_default_loop_configure_run(struct smolkvm_vm *vm)
 {
+#ifdef SMOLKVM_WANT_GDB_STUB
+	const struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+
+	return smolkvm_single_step(vm, __smolkvm_is_single_stepping(vm));
+#else
 	return 0;
+#endif
 }
 
 static void __smolkvm_default_loop_post_run(struct smolkvm_vm *vm)
@@ -3169,6 +3311,15 @@ static void __smolkvm_default_loop_post_run(struct smolkvm_vm *vm)
 			(*mmio)->post_run(vm, *mmio);
 	}
 
+#ifdef SMOLKVM_WANT_GDB_STUB
+	/*
+	 * Only block for the debugger while the target is stopped; while it
+	 * is running, packets are picked up opportunistically in pre_run on
+	 * the next exit (and SIGIO forces one).
+	 */
+	if (vm->gdb_stub.stopped)
+		__smolkvm_gdb_wait_for_data(vm);
+#endif
 }
 
 /* Default loop for running the VM */
