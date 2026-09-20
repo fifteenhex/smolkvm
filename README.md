@@ -100,3 +100,27 @@ make -f Makefile.test smoke-gpu
 boots the whole lot and passes once the console has moved onto the display.
 
 The device is 2D only: no virgl, no blob resources, no EDID.
+
+### Doom
+
+The smoke test's rootfs can also carry
+[doomgeneric](https://github.com/fifteenhex/doomgeneric) drawing through
+[smol2d](https://github.com/fifteenhex/smol2d)'s DRM backend, with id's
+shareware wad bundled alongside it:
+
+```
+make -f Makefile.test doom            # just the tarball doomgeneric builds
+make -f Makefile.test doom-initramfs  # the smolutils rootfs, with doom in it
+make -f Makefile.test smoke-gpu       # boot that, with the display
+```
+
+None of it lives here: doomgeneric packages itself, and its `Makefile.rootfs`
+fetches smol2d and the wad and hands back a tarball. All this end does is clone
+it and ask, passing the nolibc out of the kernel it already unpacked.
+
+It lands at `/usr/bin/doom` with the wad at `/usr/share/doom/doom1.wad`.
+doomgeneric's own iwad search is compiled out, so say where it is:
+
+```
+doom -iwad /usr/share/doom/doom1.wad
+```

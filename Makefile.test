@@ -6,6 +6,7 @@
 #   make -f Makefile.test smoke-gpu   # ...and again with the display
 #   make -f Makefile.test kernel      # just build vmlinux
 #   make -f Makefile.test initramfs   # just build the smolutils initramfs
+#   make -f Makefile.test doom        # just build doom and fetch its wad
 #   make -f Makefile.test clean       # drop build products, keep the downloads
 #   make -f Makefile.test distclean   # drop the build directory entirely
 #
@@ -74,7 +75,32 @@ SMOLUTILS_UAPI  := /usr/include /usr/include/x86_64-linux-gnu
 # boot has no network anyway, so leave them out.
 SMOLUTILS_FEATURE_DISABLE := net
 
-INITRAMFS := $(CURDIR)/$(SMOLUTILS_SRC)/x86_64.cpio.gz
+# smolutils always writes x86_64.cpio.gz, so both rootfs builds land on the
+# same file. Keep a copy of each under our own name; otherwise whichever was
+# built last is the one both smoke tests boot.
+SMOLUTILS_CPIO := $(CURDIR)/$(SMOLUTILS_SRC)/x86_64.cpio.gz
+INITRAMFS      := $(CURDIR)/$(BUILDDIR)/x86_64.cpio.gz
+
+# --- userspace: doom ---------------------------------------------------------
+#
+# The rootfs can also carry doomgeneric drawing through smol2d's DRM backend,
+# which is what the virtio-gpu is for. Only the `doom` and `smoke-gpu` targets
+# touch any of it, so a plain `smoke` is unaffected.
+#
+# doomgeneric packages itself: its Makefile.rootfs fetches smol2d and the wad
+# and leaves a tarball. All it wants from here is the nolibc out of the kernel
+# tree we already unpacked.
+
+DOOM_URL := https://github.com/fifteenhex/doomgeneric.git
+DOOM_REF := intern
+
+DOOM_SRC := $(BUILDDIR)/doomgeneric
+DOOM_TAR := $(CURDIR)/$(BUILDDIR)/doom.tar
+
+# smolutils grafts extra tarballs onto the rootfs with tarmunge.
+TARMUNGE_BIN := $(CURDIR)/$(TARWAK_SRC)/build/tarmunge
+
+DOOM_INITRAMFS := $(CURDIR)/$(BUILDDIR)/x86_64-doom.cpio.gz
 
 # Built by the main Makefile.
 SMOLKVM := smolkvm_test_apic_libc
@@ -157,9 +183,44 @@ $(INITRAMFS): $(KERNEL_STAMP) $(TARWAK_BIN) | $(SMOLUTILS_SRC) $(NOLIBCEXT_SRC)
 		FEATURE_DISABLE=$(SMOLUTILS_FEATURE_DISABLE) \
 		NOPIE=1 \
 		x86_64.cpio.gz
+	cp $(SMOLUTILS_CPIO) $@
 
 initramfs: $(INITRAMFS)
 .PHONY: initramfs
+
+# --- doom --------------------------------------------------------------------
+
+$(DOOM_SRC):
+	git clone --depth 1 -b $(DOOM_REF) $(DOOM_URL) $@
+
+# The kernel has to be unpacked first, for the nolibc. Always recursed into --
+# doomgeneric knows what is stale.
+$(DOOM_TAR): $(KERNEL_STAMP) | $(DOOM_SRC)
+	$(MAKE) -C $(DOOM_SRC)/doomgeneric -f Makefile.rootfs \
+		NOLIBCDIR=$(NOLIBCDIR) \
+		TARBALL=$@
+.PHONY: $(DOOM_TAR)
+
+doom: $(DOOM_TAR)
+.PHONY: doom
+
+# The same smolutils rootfs with doom grafted on.
+$(DOOM_INITRAMFS): $(KERNEL_STAMP) $(TARWAK_BIN) $(DOOM_TAR) | $(SMOLUTILS_SRC) $(NOLIBCEXT_SRC)
+	$(MAKE) -C $(SMOLUTILS_SRC) -f Makefile.x86_64 \
+		UAPIDIR="$(SMOLUTILS_UAPI)" \
+		NOLIBCDIR=$(NOLIBCDIR) \
+		NOLIBCEXTDIR=$(NOLIBCEXTDIR) \
+		CROSS_COMPILE=$(SMOLUTILS_CROSS) \
+		TARWAK=$(TARWAK_BIN) \
+		TARMUNGE=$(TARMUNGE_BIN) \
+		EXTRA_TARS=$(DOOM_TAR) \
+		FEATURE_DISABLE=$(SMOLUTILS_FEATURE_DISABLE) \
+		NOPIE=1 \
+		x86_64.cpio.gz
+	cp $(SMOLUTILS_CPIO) $@
+
+doom-initramfs: $(DOOM_INITRAMFS)
+.PHONY: doom-initramfs
 
 # --- the smoke test ----------------------------------------------------------
 
@@ -204,12 +265,12 @@ smolkvm-gpu-bits:
 	$(MAKE) $(SMOLKVM_GPU) $(IPL) SMOLRFBDIR=$(SMOLRFBDIR)
 .PHONY: smolkvm-gpu-bits
 
-# Same shape as `smoke`, with the display attached. The VNC server binds
-# loopback; connect a viewer to :5900 while it runs to watch it boot.
-smoke-gpu: $(GPU_VMLINUX) $(INITRAMFS) smolkvm-gpu-bits
-	@echo "=== booting $(KERNEL_SRC) + smolutils under smolkvm, with a display ==="
+# Same shape as `smoke`, with the display attached and doom in the rootfs. The
+# VNC server binds loopback; connect a viewer to :5900 while it runs to watch.
+smoke-gpu: $(GPU_VMLINUX) $(DOOM_INITRAMFS) smolkvm-gpu-bits
+	@echo "=== booting $(KERNEL_SRC) + smolutils + doom under smolkvm, with a display ==="
 	@rm -f $(GPU_SMOKE_LOG)
-	@./$(SMOLKVM_GPU) -k $(GPU_VMLINUX) -r $(INITRAMFS) -c "$(SMOKE_CMDLINE)" \
+	@./$(SMOLKVM_GPU) -k $(GPU_VMLINUX) -r $(DOOM_INITRAMFS) -c "$(SMOKE_CMDLINE)" \
 		> $(GPU_SMOKE_LOG) 2>&1 & \
 	pid=$$!; \
 	ok=0; \
@@ -232,10 +293,12 @@ smoke-gpu: $(GPU_VMLINUX) $(INITRAMFS) smolkvm-gpu-bits
 
 # Build products, but keep the downloaded/cloned sources.
 clean:
-	rm -rf $(KOUT) $(GPU_KOUT) $(GPU_MERGED) $(SMOKE_LOG) $(GPU_SMOKE_LOG)
+	rm -rf $(KOUT) $(GPU_KOUT) $(GPU_MERGED) $(SMOKE_LOG) $(GPU_SMOKE_LOG) \
+		$(DOOM_TAR) $(DOOM_INITRAMFS)
 	-$(MAKE) -C $(SMOLUTILS_SRC) -f Makefile.x86_64 \
 		NOLIBCDIR=$(NOLIBCDIR) NOLIBCEXTDIR=$(NOLIBCEXTDIR) \
 		CROSS_COMPILE=$(SMOLUTILS_CROSS) TARWAK=none clean 2>/dev/null
+	-$(MAKE) -C $(DOOM_SRC)/doomgeneric -f Makefile.rootfs clean 2>/dev/null
 .PHONY: clean
 
 # Everything downloaded, unpacked, cloned or built. Nothing checked in lives
