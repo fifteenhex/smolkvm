@@ -2,6 +2,7 @@
 # with the shipped config, use smolutils as the initramfs, and boot the whole
 # lot under smolkvm -- passing if the guest reaches an interactive shell.
 #
+#   make -f Makefile.test check-tools # is this machine able to build any of it
 #   make -f Makefile.test run-gpu     # boot it with a display and leave it up
 #   make -f Makefile.test run-doom    # ...with doom in the rootfs too
 #   make -f Makefile.test smoke       # the whole pipeline, as a pass/fail
@@ -227,6 +228,20 @@ $(DOOM_INITRAMFS): $(KERNEL_STAMP) $(TARWAK_BIN) $(DOOM_TAR) | $(SMOLUTILS_SRC) 
 doom-initramfs: $(DOOM_INITRAMFS)
 .PHONY: doom-initramfs
 
+# A cpio this small is not a rootfs, and the cause is almost always a missing
+# bsdtar. smolutils builds the cpio as `bsdtar | gzip` with no pipefail, so
+# without bsdtar gzip still exits 0 over an empty stream and the first sign of
+# trouble is the guest panicking with no init some minutes later.
+define check_initramfs
+	@sz=$$(stat -c %s $(1) 2>/dev/null || echo 0); \
+	if [ $$sz -lt 4096 ]; then \
+		echo "$(1) is $$sz bytes, which is not a rootfs."; \
+		echo "A missing bsdtar is the usual cause and fails silently:"; \
+		echo "    sudo apt install libarchive-tools"; \
+		exit 1; \
+	fi
+endef
+
 # --- the smoke test ----------------------------------------------------------
 
 # Build the smolkvm side via the main Makefile so we always test current code.
@@ -237,6 +252,7 @@ smolkvm-bits:
 # Boot in the background and stop the moment the marker appears. SMOKE_TIMEOUT
 # is only the failure cap.
 smoke: $(VMLINUX) $(INITRAMFS) smolkvm-bits
+	$(call check_initramfs,$(INITRAMFS))
 	@echo "=== booting $(KERNEL_SRC) + smolutils under smolkvm ==="
 	@rm -f $(SMOKE_LOG)
 	@./$(SMOLKVM) -k $(VMLINUX) -r $(INITRAMFS) -c "$(SMOKE_CMDLINE)" \
@@ -273,6 +289,7 @@ smolkvm-gpu-bits:
 # Same shape as `smoke`, with the display attached and doom in the rootfs. The
 # VNC server binds loopback; connect a viewer to :5900 while it runs to watch.
 smoke-gpu: $(GPU_VMLINUX) $(DOOM_INITRAMFS) smolkvm-gpu-bits
+	$(call check_initramfs,$(DOOM_INITRAMFS))
 	@echo "=== booting $(KERNEL_SRC) + smolutils + doom under smolkvm, with a display ==="
 	@rm -f $(GPU_SMOKE_LOG)
 	@./$(SMOLKVM_GPU) -k $(GPU_VMLINUX) -r $(DOOM_INITRAMFS) -c "$(SMOKE_CMDLINE)" \
@@ -318,6 +335,7 @@ endef
 # that one kills the VM as soon as its marker shows up. No doom in this
 # rootfs, so it needs nothing unpublished.
 run-gpu: $(GPU_VMLINUX) $(INITRAMFS) smolkvm-gpu-bits
+	$(call check_initramfs,$(INITRAMFS))
 	$(call say_vnc,booting $(KERNEL_SRC) + smolutils with a display)
 	@./$(SMOLKVM_GPU) -k $(GPU_VMLINUX) -r $(INITRAMFS) \
 		-c "$(RUN_CMDLINE)" -p $(VNC_PORT)
@@ -325,6 +343,7 @@ run-gpu: $(GPU_VMLINUX) $(INITRAMFS) smolkvm-gpu-bits
 
 # ...and the same with doom in the rootfs.
 run-doom: $(GPU_VMLINUX) $(DOOM_INITRAMFS) smolkvm-gpu-bits
+	$(call check_initramfs,$(DOOM_INITRAMFS))
 	$(call say_vnc,booting $(KERNEL_SRC) + smolutils + doom with a display)
 	@echo "=== at the smolsh prompt:"
 	@echo "===     doom -iwad /usr/share/doom/doom1.wad"
@@ -332,6 +351,33 @@ run-doom: $(GPU_VMLINUX) $(DOOM_INITRAMFS) smolkvm-gpu-bits
 	@./$(SMOLKVM_GPU) -k $(GPU_VMLINUX) -r $(DOOM_INITRAMFS) \
 		-c "$(RUN_CMDLINE)" -p $(VNC_PORT)
 .PHONY: run-doom
+
+# Everything the pipeline shells out to. Most of them fail a long way from the
+# thing that is actually missing, so check up front.
+REQUIRED_TOOLS := gcc make git curl tar gzip meson ninja bsdtar flex bison bc
+
+check-tools:
+	@missing=""; \
+	for t in $(REQUIRED_TOOLS); do \
+		command -v $$t >/dev/null 2>&1 || missing="$$missing $$t"; \
+	done; \
+	if [ ! -e /dev/kvm ]; then missing="$$missing /dev/kvm"; fi; \
+	if [ -e /dev/kvm ] && [ ! -r /dev/kvm -o ! -w /dev/kvm ]; then \
+		echo "/dev/kvm is there but not readable/writable by you;"; \
+		echo "    sudo usermod -aG kvm $$USER   (then log in again)"; \
+		exit 1; \
+	fi; \
+	if [ -n "$$missing" ]; then \
+		echo "missing:$$missing"; \
+		echo; \
+		echo "on Debian / Ubuntu:"; \
+		echo "    sudo apt install build-essential flex bison bc libelf-dev \\"; \
+		echo "        libssl-dev git meson libarchive-dev libcjson-dev \\"; \
+		echo "        libcap-dev libarchive-tools"; \
+		exit 1; \
+	fi; \
+	echo "all present"
+.PHONY: check-tools
 
 # --- cleanup -----------------------------------------------------------------
 
