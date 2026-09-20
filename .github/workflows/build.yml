@@ -18,3 +18,19 @@ jobs:
 
     - name: Build
       run: make
+
+    # The virtio-gpu is optional and lives behind a header from another repo,
+    # so it is not covered by the build above and would rot unnoticed.
+    - name: Check out smolrfb
+      uses: actions/checkout@v4
+      with:
+        repository: fifteenhex/smolrfb
+        path: smolrfb
+
+    - name: Build with the virtio-gpu
+      run: make SMOLRFBDIR=$GITHUB_WORKSPACE/smolrfb
+
+    # No /dev/kvm on a runner, so the smoke test cannot boot anything -- but the
+    # device model is all plain function calls and this exercises it.
+    - name: Test the virtio-gpu
+      run: make check-gpu SMOLRFBDIR=$GITHUB_WORKSPACE/smolrfb

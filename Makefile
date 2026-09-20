@@ -30,6 +30,8 @@ GPU_TARGETS    := $(addprefix smolkvm_test_apic_gpu,$(VARIANTS))
 ALL_TARGETS    += $(GPU_TARGETS)
 endif
 
+GPU_SELFTEST := smolkvm_gpu_selftest
+
 # The generated header describes the APIC machine (that is what the IPL boots),
 # so it is dumped by the plain APIC build.
 HDR_GEN := smolkvm_test_apic_libc
@@ -46,6 +48,21 @@ $(GPU_TARGETS):                                         EXTRA_FLAGS += $(GPU_FLA
 
 $(ALL_TARGETS): $(SRC) $(HDR)
 	$(CC) $(COPTS) $(MACHINETYPE) $(EXTRA_FLAGS) -o $@ $(SRC)
+
+# The virtio-gpu's own test. It drives the device model through plain function
+# calls rather than a vCPU, so unlike the smoke test it needs no /dev/kvm. The
+# sanitizers are on because most of what it feeds in is guest supplied.
+ifdef SMOLRFBDIR
+all: $(GPU_SELFTEST)
+
+$(GPU_SELFTEST): $(GPU_SELFTEST).c $(HDR)
+	$(CC) $(COPTS) -O1 -fsanitize=address,undefined -DSMOLKVM_WANT_APIC \
+		$(GPU_FLAGS) -I. -o $@ $<
+
+.PHONY: check-gpu
+check-gpu: $(GPU_SELFTEST)
+	./$(GPU_SELFTEST)
+endif
 
 # `-h` only reads compile-time constants, so this needs no /dev/kvm and works
 # on a bare build host (CI, cross builds).
@@ -90,6 +107,6 @@ endif
 
 .PHONY: clean
 clean:
-	rm -f $(ALL_TARGETS) smolkvm_test smolkvm_test_gdb smolkvm_test_gpu
+	rm -f $(ALL_TARGETS) smolkvm_test smolkvm_test_gdb smolkvm_test_gpu $(GPU_SELFTEST)
 	rm -f ipl/include/machine.h
 	$(MAKE) -C ipl/ clean 2>/dev/null || true
