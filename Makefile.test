@@ -2,6 +2,8 @@
 # with the shipped config, use smolutils as the initramfs, and boot the whole
 # lot under smolkvm -- passing if the guest reaches an interactive shell.
 #
+#   make -f Makefile.test run-gpu     # boot it with a display and leave it up
+#   make -f Makefile.test run-doom    # ...with doom in the rootfs too
 #   make -f Makefile.test smoke       # the whole pipeline, as a pass/fail
 #   make -f Makefile.test smoke-gpu   # ...and again with the display
 #   make -f Makefile.test kernel      # just build vmlinux
@@ -12,6 +14,9 @@
 #
 # Nothing checked in lives under the build directory, so deleting it is always
 # safe: the kernel config fragments the build needs are in test/.
+#
+# smoke-gpu stops the VM as soon as it has decided; run-gpu is the one to use
+# when you want to look at the screen.
 #
 # Needs KVM (the boot runs a real VM) and, on Debian / Ubuntu:
 #   build-essential flex bison bc libelf-dev libssl-dev   # kernel (libelf is
@@ -288,6 +293,45 @@ smoke-gpu: $(GPU_VMLINUX) $(DOOM_INITRAMFS) smolkvm-gpu-bits
 		exit 1; \
 	fi
 .PHONY: smoke-gpu
+
+# --- running it, to actually look at -----------------------------------------
+
+# console=tty0 puts the kernel log on the display; without it you get the boot
+# logo on black and no way to tell a working display from a stuck one.
+#
+# Two gettys: one on the serial console and one on tty1, so the display has a
+# shell on it rather than just the tail of the boot. tty1 shares the screen
+# with printk, so a late message lands on top of the prompt.
+RUN_CMDLINE ?= console=tty0 console=ttyS0 -- \
+	       smolinit.getty=/dev/ttyS0 smolinit.getty=/dev/tty1
+VNC_PORT    ?= 5900
+
+define say_vnc
+	@echo
+	@echo "=== $(1)"
+	@echo "=== point a VNC viewer at 127.0.0.1:$(VNC_PORT)"
+	@echo "=== the guest console is here too; ctrl-c to stop"
+	@echo
+endef
+
+# Boot Linux with the display and leave it running, which smoke-gpu does not:
+# that one kills the VM as soon as its marker shows up. No doom in this
+# rootfs, so it needs nothing unpublished.
+run-gpu: $(GPU_VMLINUX) $(INITRAMFS) smolkvm-gpu-bits
+	$(call say_vnc,booting $(KERNEL_SRC) + smolutils with a display)
+	@./$(SMOLKVM_GPU) -k $(GPU_VMLINUX) -r $(INITRAMFS) \
+		-c "$(RUN_CMDLINE)" -p $(VNC_PORT)
+.PHONY: run-gpu
+
+# ...and the same with doom in the rootfs.
+run-doom: $(GPU_VMLINUX) $(DOOM_INITRAMFS) smolkvm-gpu-bits
+	$(call say_vnc,booting $(KERNEL_SRC) + smolutils + doom with a display)
+	@echo "=== at the smolsh prompt:"
+	@echo "===     doom -iwad /usr/share/doom/doom1.wad"
+	@echo
+	@./$(SMOLKVM_GPU) -k $(GPU_VMLINUX) -r $(DOOM_INITRAMFS) \
+		-c "$(RUN_CMDLINE)" -p $(VNC_PORT)
+.PHONY: run-doom
 
 # --- cleanup -----------------------------------------------------------------
 

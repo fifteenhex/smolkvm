@@ -62,12 +62,24 @@ viewers. It is off unless asked for, and needs the APIC machine (the driver
 wants a real interrupt) plus a smolrfb checkout to include:
 
 ```
+make -f Makefile.test check-tools   # is this machine able to build it
+make -f Makefile.test run-gpu       # build the lot, boot it, leave it up
+```
+
+and point a VNC viewer at `127.0.0.1:5900`. That builds a kernel and a rootfs
+from scratch the first time, so it is not quick. `VNC_PORT` and `RUN_CMDLINE`
+override the obvious things. There is a shell on the serial console and, with
+`console=tty0`, the kernel log on the display as well.
+
+To drive it yourself instead:
+
+```
 make SMOLRFBDIR=/path/to/smolrfb
 ./smolkvm_test_apic_gpu_libc -k vmlinux -r initramfs.cpio.gz \
 	-c "console=tty0 console=ttyS0" -g 1280x800 -p 5900
 ```
 
-and point a VNC viewer at `127.0.0.1:5900`. `console=tty0` is what puts the
+`console=tty0` is what puts the
 kernel log on the display; without it you get the boot logo on black and no way
 to tell a working display from a stuck one. Note also that Linux stops reading
 its own parameters at a standalone `--`, so anything after that goes to init
@@ -111,7 +123,7 @@ shareware wad bundled alongside it:
 ```
 make -f Makefile.test doom            # just the tarball doomgeneric builds
 make -f Makefile.test doom-initramfs  # the smolutils rootfs, with doom in it
-make -f Makefile.test smoke-gpu       # boot that, with the display
+make -f Makefile.test run-doom        # boot that, with the display
 ```
 
 None of it lives here: doomgeneric packages itself, and its `Makefile.rootfs`
