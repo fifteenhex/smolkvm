@@ -4,6 +4,8 @@
 #include "machine.h"
 
 #define SMOLKVM_MAILBOX_CMD_SHIFT	48
+#define SMOLKVM_MAILBOX_CMD_MINUSER	16
+#define SMOLKVM_MAILBOX_CMD_GETPARAMS (SMOLKVM_MAILBOX_CMD_MINUSER + 0)
 
 static inline void mailbox_post(uint16_t cmd, void *buffer)
 {
@@ -13,5 +15,11 @@ static inline void mailbox_post(uint16_t cmd, void *buffer)
 }
 
 #define SMOLKVM_MAILBOX_CMD_DIE			1
+#define SMOLKVM_MAILBOX_CMD_MAP_MEMORY		3
+
+struct smolkvm_mailbox_map_memory {
+	uint64_t gpa;
+	uint64_t size;
+};
 
 #endif /* _MAILBOX_H */
