@@ -1,24 +1,27 @@
-# A Linux kernel to test with: download a release tarball, unpack it into the
-# build directory and build a minimal vmlinux from the shipped config.
+# The pieces the smoke test is built out of: a Linux kernel and a smolutils
+# initramfs, both built from source into the build directory.
 #
 #   make -f Makefile.test kernel      # just build vmlinux
+#   make -f Makefile.test initramfs   # just build the smolutils initramfs
 #   make -f Makefile.test clean       # drop build products, keep the downloads
 #   make -f Makefile.test distclean   # drop the build directory entirely
 #
 # Nothing checked in lives under the build directory, so deleting it is always
 # safe: the kernel config fragments the build needs are in test/.
 #
-# Needs, on Debian / Ubuntu:
+# Needs KVM (the boot runs a real VM) and, on Debian / Ubuntu:
 #   build-essential flex bison bc libelf-dev libssl-dev   # kernel (libelf is
 #                                                          # for objtool)
+#   git meson libarchive-dev libcjson-dev libcap-dev      # tarwak
+#   libarchive-tools                                      # bsdtar, for the cpio
 
 # TESTDIR is checked in and must survive; BUILDDIR is everything downloaded,
 # unpacked, cloned or built and can be deleted at any time to start over.
 TESTDIR  := test
 BUILDDIR := build
 
-# An -rc: the userspace built against this kernel's nolibc wants a getcwd(),
-# which only landed after 7.2. Release tarballs live under cdn.kernel.org/pub/linux/kernel/vX.x/
+# An -rc, because smolutils' smolsh calls getcwd() and nolibc only grew one
+# after 7.2. Release tarballs live under cdn.kernel.org/pub/linux/kernel/vX.x/
 # and -rc ones are generated on demand at git.kernel.org/torvalds/t/, where they
 # are also dropped again once the next -rc lands -- so this needs bumping now
 # and then until 7.3 is out and it can go back to a release.
@@ -32,6 +35,35 @@ KERNEL_STAMP   := $(BUILDDIR)/.linux-$(KERNEL_VERSION).extracted
 KOUT    := $(CURDIR)/$(KERNEL_SRC)/smolkvm-build
 VMLINUX := $(KOUT)/vmlinux
 CONFIG  := $(CURDIR)/$(TESTDIR)/kernel.config
+
+# --- userspace: smolutils ----------------------------------------------------
+
+SMOLUTILS_URL := https://github.com/fifteenhex/smolutils.git
+TARWAK_URL    := https://github.com/fifteenhex/tarwak.git
+NOLIBCEXT_URL := https://github.com/fifteenhex/nolibc-extensions.git
+
+SMOLUTILS_SRC := $(BUILDDIR)/smolutils
+TARWAK_SRC    := $(BUILDDIR)/tarwak
+TARWAK_BIN    := $(CURDIR)/$(TARWAK_SRC)/build/tarwak
+NOLIBCEXT_SRC := $(BUILDDIR)/nolibc-extensions
+
+# smolutils builds against nolibc; take it from the kernel tree we already
+# unpack rather than fetching a second copy. The extensions on top (sockets,
+# fcntl, the signal bits) are their own repo, and smolutils insists on being
+# told where they are.
+NOLIBCDIR    := $(CURDIR)/$(KERNEL_SRC)/tools/include/nolibc
+NOLIBCEXTDIR := $(CURDIR)/$(NOLIBCEXT_SRC)
+
+# Building x86-64 on x86-64: the host's triple-prefixed toolchain is a fine
+# "cross" toolchain, so no separate download.
+SMOLUTILS_CROSS := x86_64-linux-gnu-
+SMOLUTILS_UAPI  := /usr/include /usr/include/x86_64-linux-gnu
+
+# The net utilities want socket headers nolibc does not ship, and the smoke
+# boot has no network anyway, so leave them out.
+SMOLUTILS_FEATURE_DISABLE := net
+
+INITRAMFS := $(CURDIR)/$(SMOLUTILS_SRC)/x86_64.cpio.gz
 
 NPROC := $(shell nproc 2>/dev/null || echo 1)
 
@@ -59,11 +91,45 @@ $(VMLINUX): $(KERNEL_STAMP) $(CONFIG)
 kernel: $(VMLINUX)
 .PHONY: kernel
 
+# --- smolutils initramfs -----------------------------------------------------
+
+$(SMOLUTILS_SRC):
+	git clone --depth 1 $(SMOLUTILS_URL) $@
+
+$(TARWAK_SRC):
+	git clone --depth 1 $(TARWAK_URL) $@
+
+$(NOLIBCEXT_SRC):
+	git clone --depth 1 $(NOLIBCEXT_URL) $@
+
+$(TARWAK_BIN): | $(TARWAK_SRC)
+	cd $(TARWAK_SRC) && meson setup build && meson compile -C build
+
+# nolibc lives in the kernel tree, so that has to be unpacked first. NOPIE=1
+# builds plain -static rather than static-PIE, which is what upstream nolibc
+# (what the kernel tarball ships) supports.
+$(INITRAMFS): $(KERNEL_STAMP) $(TARWAK_BIN) | $(SMOLUTILS_SRC) $(NOLIBCEXT_SRC)
+	$(MAKE) -C $(SMOLUTILS_SRC) -f Makefile.x86_64 \
+		UAPIDIR="$(SMOLUTILS_UAPI)" \
+		NOLIBCDIR=$(NOLIBCDIR) \
+		NOLIBCEXTDIR=$(NOLIBCEXTDIR) \
+		CROSS_COMPILE=$(SMOLUTILS_CROSS) \
+		TARWAK=$(TARWAK_BIN) \
+		FEATURE_DISABLE=$(SMOLUTILS_FEATURE_DISABLE) \
+		NOPIE=1 \
+		x86_64.cpio.gz
+
+initramfs: $(INITRAMFS)
+.PHONY: initramfs
+
 # --- cleanup -----------------------------------------------------------------
 
 # Build products, but keep the downloaded/cloned sources.
 clean:
 	rm -rf $(KOUT)
+	-$(MAKE) -C $(SMOLUTILS_SRC) -f Makefile.x86_64 \
+		NOLIBCDIR=$(NOLIBCDIR) NOLIBCEXTDIR=$(NOLIBCEXTDIR) \
+		CROSS_COMPILE=$(SMOLUTILS_CROSS) TARWAK=none clean 2>/dev/null
 .PHONY: clean
 
 # Everything downloaded, unpacked, cloned or built. Nothing checked in lives
