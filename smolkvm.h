@@ -1607,6 +1607,170 @@ static inline void __smolkvm_gdb_stub_send_packet(struct smolkvm_vm *vm,
 #endif
 }
 
+static inline int __smolkvm_gdb_stub_process_packet_stop_reason(struct smolkvm_vm *vm)
+{
+	__smolkvm_gdb_stub_send_packet(vm, "S05", 3);
+	return 1;
+}
+
+#define __smolkvm_gdb_stub_encode_reg64(_head, _regval)	\
+	do {						\
+		__smolkvm_gdb_u64tohex(_regval, _head);	\
+		_head += 16;				\
+	} while(0)
+
+#define __smolkvm_gdb_stub_encode_reg32(_head, _regval)	\
+	do {						\
+		__smolkvm_gdb_u32tohex(_regval, _head);	\
+		_head += 8;				\
+	} while(0)
+
+static inline int __smolkvm_gdb_stub_process_packet_read_regs(struct smolkvm_vm *vm)
+{
+	struct kvm_regs regs = { 0 };
+	struct kvm_sregs sregs = { 0 };
+	unsigned char buf[(17 * 16) + (7 * 8)];
+	unsigned char *head = buf;
+	int ret, pos = 0;
+
+	ret = __smolkvm_get_regs(vm, &regs);
+	if (ret) {
+		printf("failed to read regs %d\n", errno);
+	}
+
+	ret = __smolkvm_get_sregs(vm, &sregs);
+	if (ret) {
+		printf("failed to read special regs %d\n", errno);
+		//return -1;
+	}
+
+	memset(buf, '0', sizeof(buf));
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rax);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rbx);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rcx);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rdx);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rsi);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rdi);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rbp);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rsp);
+
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r8);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r9);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r10);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r11);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r12);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r13);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r14);
+	__smolkvm_gdb_stub_encode_reg64(head, regs.r15);
+
+	__smolkvm_gdb_stub_encode_reg64(head, regs.rip);
+
+	__smolkvm_gdb_stub_encode_reg32(head, regs.rflags);
+
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.cs.selector);
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.ss.selector);
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.ds.selector);
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.es.selector);
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.fs.selector);
+	__smolkvm_gdb_stub_encode_reg32(head, sregs.gs.selector);
+
+	__smolkvm_gdb_stub_send_packet(vm, buf, sizeof(buf));
+	return 1;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_read_mem(struct smolkvm_vm *vm,
+							      struct smolkvm_gdb_stub_pkt *pkt)
+{
+	uint64_t addr = pkt->read_mem.addr;
+	uint64_t len = pkt->read_mem.len;
+	char hexbuff[256] = { 0 };
+	uint8_t buff[128];
+	unsigned int i;
+
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("read memory: addr=0x%llx len=%llu\n", (unsigned long long) addr, (unsigned long long) len);
+#endif
+
+	/*
+	 * The requested length is whatever the debugger asked for; a short
+	 * reply is fine (GDB re-requests the rest), overflowing the buffers
+	 * with a remote-controlled length is not.
+	 */
+	if (len > sizeof(buff))
+		len = sizeof(buff);
+
+	if (__smolkvm_memory_read(vm, addr, len, buff)) {
+		__smolkvm_gdb_stub_send_packet(vm, "E01", 3);
+		return 1;
+	}
+
+	for (i = 0; i < len; i++)
+		__smolkvm_gdb_u8tohex(&hexbuff[i * 2], buff[i]);
+
+	__smolkvm_gdb_stub_send_packet(vm, hexbuff, len * 2);
+
+	return 1;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_query(struct smolkvm_vm *vm,
+						  struct smolkvm_gdb_stub_pkt *pkt)
+{
+	struct smolkvm_gdb_stub_pkt_query *query = &pkt->query;
+
+	#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("processing query packet, subtype: %d\n", query->subtype);
+	#endif
+
+	switch (query->subtype) {
+	case SMOLKVM_GDB_STUB_QUERY_ATTACHED:
+		__smolkvm_gdb_stub_send_packet(vm, "1", 1);
+		return 1;
+	case SMOLKVM_GDB_STUB_QUERY_SUPPORTED:
+		const char pkt_string[] = "PacketSize=2048;qXfer:features:read+;arch=i386:x86-64";
+		__smolkvm_gdb_stub_send_packet(vm, pkt_string, strlen(pkt_string));
+		return 1;
+	case SMOLKVM_GDB_STUB_QUERY_XFER_FEATURES:
+		const char target_xml[] = "l" SMOLKVM_GDB_TARGET_XML;
+		__smolkvm_gdb_stub_send_packet(vm, target_xml, strlen(target_xml));
+		return 1;
+	}
+
+	return 0;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_h(struct smolkvm_vm *vm,
+						  struct smolkvm_gdb_stub_pkt *pkt)
+{
+	struct smolkvm_gdb_stub_pkt_h *h = &pkt->h;
+
+	#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("processing H packet, subtype: %d\n", h->subtype);
+	#endif
+
+	__smolkvm_gdb_stub_send_packet(vm, "OK", 2);
+	return 1;
+}
+
+static inline int __smolkvm_gdb_stub_process_packet_v(struct smolkvm_vm *vm,
+						  struct smolkvm_gdb_stub_pkt *pkt)
+{
+	struct smolkvm_gdb_stub_pkt_v *v = &pkt->v;
+
+	#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("processing v packet, subtype: %d\n", v->subtype);
+	#endif
+
+	switch (v->subtype) {
+	//case SMOLKVM_GDB_STUB_QUERY_SUPPORTED:
+	//	break;
+	case SMOLKVM_GDB_STUB_V_MUSTREPLYEMPTY:
+	default:
+		/* Don't do anything, let an empty packet get sent. */
+		break;
+	}
+	return 0;
+}
+
 #endif /* SMOLKVM_WANT_GDB_STUB */
 #endif /* fold */
 
