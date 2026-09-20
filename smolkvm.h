@@ -87,6 +87,11 @@
 #if defined(SMOLKVM_WANT_SIMPLE) && defined(SMOLKVM_WANT_APIC)
 #error "smolkvm: define only one of SMOLKVM_WANT_SIMPLE or SMOLKVM_WANT_APIC"
 #endif
+
+/*
+ * The transport is compiled in when a device that rides it is; nothing
+ * defines this on its own yet.
+ */
 #if !defined(SMOLKVM_WANT_SIMPLE) && !defined(SMOLKVM_WANT_APIC)
 #define SMOLKVM_WANT_SIMPLE
 #endif
@@ -1366,6 +1371,30 @@ static inline int __smolkvm_memory_set(const struct smolkvm_vm *vm, uint64_t add
 	memset(SMOLKVM_MEMREGION_PTR(memory_region, addr), byte, len);
 
 	return 0;
+}
+
+/*
+ * A host pointer to `len` bytes of guest physical memory, or NULL if the range
+ * is not covered by exactly one memslot. Anything that just wants the bytes
+ * should use the read/write helpers above; this is for the places where the
+ * second copy is the expensive part -- a whole framebuffer, or a structure a
+ * device pokes at over and over like a virtqueue.
+ */
+static inline void *__smolkvm_memory_ptr(const struct smolkvm_vm *vm, uint64_t addr, uint64_t len)
+{
+	const struct kvm_userspace_memory_region *memory_region;
+	int region;
+
+	region = __smolkvm_find_memregion(vm, addr);
+	if (region < 0)
+		return NULL;
+
+	memory_region = &vm->memregions[region];
+
+	if (__smolkvm_memory_check_bounds(addr, len, memory_region))
+		return NULL;
+
+	return SMOLKVM_MEMREGION_PTR(memory_region, addr);
 }
 
 int smolkvm_guest_read(struct smolkvm_vm *vm, uint64_t gpa, uint64_t len, void *dst)
@@ -3002,6 +3031,602 @@ static inline int __smolkvm_timer_create(struct smolkvm_vm *vm)
 }
 
 #endif /* SMOLKVM_WANT_SIMPLE */
+#endif
+/* -- */
+
+/* virtio-mmio: the transport the virtio devices sit on */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_VIRTIO
+
+/*
+ * Enough virtio-mmio for a device to be found and talked to: the register
+ * window, feature negotiation and split virtqueues. Nothing here knows what
+ * any particular device does -- a device supplies its id, its configuration
+ * space and a notify callback and gets the rest.
+ *
+ * virtio-mmio rather than virtio-pci because there is no PCI here to hang a
+ * virtio-pci off. It needs no bus: one register window, named to Linux on the
+ * kernel command line as `virtio_mmio.device=<len>@<base>:<irq>`, with no
+ * device tree and no ACPI description.
+ *
+ * Everything the guest and a device share is little-endian, and so is every
+ * machine this runs on, so they are plain structs read straight out of guest
+ * memory rather than unpacked field by field.
+ */
+
+/* virtio-mmio register window (linux/virtio_mmio.h) */
+#define __SMOLKVM_VIRTIO_MMIO_MAGIC		0x000
+#define __SMOLKVM_VIRTIO_MMIO_VERSION		0x004
+#define __SMOLKVM_VIRTIO_MMIO_DEVICE_ID		0x008
+#define __SMOLKVM_VIRTIO_MMIO_VENDOR_ID		0x00c
+#define __SMOLKVM_VIRTIO_MMIO_DEVICE_FEATURES	0x010
+#define __SMOLKVM_VIRTIO_MMIO_DEVICE_FEATURES_SEL 0x014
+#define __SMOLKVM_VIRTIO_MMIO_DRIVER_FEATURES	0x020
+#define __SMOLKVM_VIRTIO_MMIO_DRIVER_FEATURES_SEL 0x024
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_SEL		0x030
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_NUM_MAX	0x034
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_NUM		0x038
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_READY	0x044
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_NOTIFY	0x050
+#define __SMOLKVM_VIRTIO_MMIO_INTERRUPT_STATUS	0x060
+#define __SMOLKVM_VIRTIO_MMIO_INTERRUPT_ACK	0x064
+#define __SMOLKVM_VIRTIO_MMIO_STATUS		0x070
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_DESC_LOW	0x080
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_DESC_HIGH	0x084
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_AVAIL_LOW	0x090
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_AVAIL_HIGH	0x094
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_USED_LOW	0x0a0
+#define __SMOLKVM_VIRTIO_MMIO_QUEUE_USED_HIGH	0x0a4
+#define __SMOLKVM_VIRTIO_MMIO_SHM_SEL		0x0ac
+#define __SMOLKVM_VIRTIO_MMIO_SHM_LEN_LOW	0x0b0
+#define __SMOLKVM_VIRTIO_MMIO_SHM_LEN_HIGH	0x0b4
+#define __SMOLKVM_VIRTIO_MMIO_SHM_BASE_LOW	0x0b8
+#define __SMOLKVM_VIRTIO_MMIO_SHM_BASE_HIGH	0x0bc
+#define __SMOLKVM_VIRTIO_MMIO_CONFIG_GENERATION	0x0fc
+#define __SMOLKVM_VIRTIO_MMIO_CONFIG		0x100
+
+/* "virt", the magic every driver checks first */
+#define __SMOLKVM_VIRTIO_MMIO_MAGIC_VALUE	0x74726976
+#define __SMOLKVM_VIRTIO_MMIO_VERSION_VALUE	2
+/* "SMOL". Only ever printed, but it may as well say who it is. */
+#define __SMOLKVM_VIRTIO_MMIO_VENDOR_VALUE	0x4c4f4d53
+#define __SMOLKVM_VIRTIO_ID_GPU			16
+
+#define __SMOLKVM_VIRTIO_MMIO_INT_VRING		SMOLKVM_BIT(0)
+
+/* Device status bits the driver walks up as it initialises */
+#define __SMOLKVM_VIRTIO_STATUS_FEATURES_OK	SMOLKVM_BIT(3)
+#define __SMOLKVM_VIRTIO_STATUS_DRIVER_OK	SMOLKVM_BIT(2)
+#define __SMOLKVM_VIRTIO_STATUS_FAILED		SMOLKVM_BIT(7)
+
+/* The one feature offered: this is a modern (version 2) transport */
+#define __SMOLKVM_VIRTIO_F_VERSION_1		SMOLKVM_BIT(32)
+
+/* Split virtqueue descriptor flags */
+#define __SMOLKVM_VRING_DESC_F_NEXT		SMOLKVM_BIT(0)
+#define __SMOLKVM_VRING_DESC_F_WRITE		SMOLKVM_BIT(1)
+
+struct __smolkvm_vring_desc {
+	uint64_t addr;
+	uint32_t len;
+	uint16_t flags;
+	uint16_t next;
+};
+
+struct __smolkvm_vring_used_elem {
+	uint32_t id;
+	uint32_t len;
+};
+
+struct __smolkvm_virtq {
+	uint32_t num;		/* size the driver chose; 0 until it has */
+	bool ready;
+
+	uint64_t desc_gpa;
+	uint64_t avail_gpa;
+	uint64_t used_gpa;
+
+	uint16_t last_avail;	/* first avail ring slot we have not taken yet */
+};
+
+/*
+ * One descriptor chain, read and written as two byte streams. The driver may
+ * split a request across descriptors however it likes, so the device-readable
+ * ("out") and device-writable ("in") halves are each walked in order rather
+ * than assuming one descriptor each.
+ */
+struct __smolkvm_virtq_chain {
+	struct __smolkvm_vring_desc *desc;	/* the table, host side */
+	uint32_t num;
+	uint16_t head;
+
+	int out_idx;		/* descriptor being read, -1 once exhausted */
+	uint32_t out_off;
+	int in_idx;		/* descriptor being written, -1 once full */
+	uint32_t in_off;
+
+	uint32_t written;	/* what goes in the used ring */
+};
+
+
+/*
+ * One device on the transport. The device itself owns this, fills in what
+ * describes it, and is called back when the driver kicks a queue or resets it.
+ */
+struct __smolkvm_virtio_mmio {
+	uint32_t device_id;
+	uint64_t device_features;
+
+	/* Negotiation state, which is all per-32-bit-half of a 64 bit word */
+	uint32_t device_features_sel;
+	uint64_t driver_features;
+	uint32_t driver_features_sel;
+
+	uint32_t queue_sel;
+	uint32_t status;
+	uint32_t interrupt_status;
+
+	unsigned int irq;
+	bool irq_level;
+
+	struct __smolkvm_virtq *vq;
+	unsigned int num_vq;
+	uint32_t queue_sz;
+
+	/* The device configuration space, read (and sometimes written) at 0x100 */
+	void *config;
+	size_t config_len;
+
+	/* The driver kicked `queue`; go and look at what is in it */
+	void (*notify)(struct smolkvm_vm *vm,
+		       struct __smolkvm_virtio_mmio *dev,
+		       uint32_t queue);
+	/* Back to nothing negotiated and nothing owned */
+	void (*reset)(struct smolkvm_vm *vm,
+		      struct __smolkvm_virtio_mmio *dev);
+	/*
+	 * A write into the configuration space. Most devices have none that are
+	 * writable; the ones that do use it to pick what the space shows next.
+	 */
+	void (*config_write)(struct smolkvm_vm *vm,
+			     struct __smolkvm_virtio_mmio *dev,
+			     uint64_t offset, uint8_t len, uint64_t value);
+
+	void *priv;
+};
+
+/* The line follows "is there anything the driver has not collected yet" */
+static void __smolkvm_virtio_update_irq(struct smolkvm_vm *vm,
+					struct __smolkvm_virtio_mmio *dev)
+{
+	bool level = dev->interrupt_status != 0;
+
+	if (level != dev->irq_level) {
+		__smolkvm_irq_line(vm, dev->irq, level);
+		dev->irq_level = level;
+	}
+}
+
+/* Say a queue has something in it, after putting it there */
+static void __smolkvm_virtio_signal_used(struct smolkvm_vm *vm,
+					 struct __smolkvm_virtio_mmio *dev)
+{
+	dev->interrupt_status |= __SMOLKVM_VIRTIO_MMIO_INT_VRING;
+	__smolkvm_virtio_update_irq(vm, dev);
+}
+
+/* -- the split virtqueue -- */
+
+/*
+ * Take the next available descriptor chain, or false if the ring is empty.
+ * Everything in it comes from the guest, so everything in it is checked.
+ */
+static bool __smolkvm_virtq_pop(struct smolkvm_vm *vm, struct __smolkvm_virtq *vq,
+				struct __smolkvm_virtq_chain *chain)
+{
+	struct __smolkvm_vring_desc *desc;
+	uint16_t *avail;
+	uint16_t head;
+
+	if (!vq->ready || !vq->num)
+		return false;
+
+	avail = __smolkvm_memory_ptr(vm, vq->avail_gpa, 4 + (uint64_t) vq->num * 2);
+	desc = __smolkvm_memory_ptr(vm, vq->desc_gpa,
+				    (uint64_t) vq->num * sizeof(*desc));
+	if (!avail || !desc)
+		return false;
+
+	/* avail is { flags, idx, ring[] }, all 16 bit */
+	if (avail[1] == vq->last_avail)
+		return false;
+
+	head = avail[2 + (vq->last_avail % vq->num)];
+	vq->last_avail++;
+
+	if (head >= vq->num) {
+		printf("virtio: avail ring points at descriptor %u of %u\n",
+		       head, vq->num);
+		return false;
+	}
+
+	memset(chain, 0, sizeof(*chain));
+	chain->desc = desc;
+	chain->num = vq->num;
+	chain->head = head;
+	chain->out_idx = (int) head;
+	chain->in_idx = (int) head;
+
+	return true;
+}
+
+/* Hand the chain back to the driver, having written `chain->written` bytes */
+static void __smolkvm_virtq_push(struct smolkvm_vm *vm, struct __smolkvm_virtq *vq,
+				 const struct __smolkvm_virtq_chain *chain)
+{
+	struct __smolkvm_vring_used_elem *ring;
+	uint16_t *used;
+	uint16_t idx;
+
+	used = __smolkvm_memory_ptr(vm, vq->used_gpa, 4 + (uint64_t) vq->num
+				    * sizeof(struct __smolkvm_vring_used_elem));
+	if (!used)
+		return;
+
+	/* used is { flags, idx, ring[] }; the ring starts 4 bytes in */
+	ring = (struct __smolkvm_vring_used_elem *) (used + 2);
+	idx = used[1];
+
+	ring[idx % vq->num].id = chain->head;
+	ring[idx % vq->num].len = chain->written;
+
+	/* The new index must not become visible before the entry behind it */
+	__sync_synchronize();
+	used[1] = idx + 1;
+}
+
+/*
+ * From `idx` inclusive, the next descriptor of the wanted direction, or -1.
+ * The chain comes from the guest and may be a loop, so give up after one pass
+ * rather than spinning here forever.
+ */
+static int __smolkvm_virtq_chain_next(const struct __smolkvm_virtq_chain *chain,
+				      int idx, bool want_write)
+{
+	uint32_t steps = 0;
+
+	while (idx >= 0 && (uint32_t) idx < chain->num) {
+		const struct __smolkvm_vring_desc *d = &chain->desc[idx];
+
+		if (d->len && !!(d->flags & __SMOLKVM_VRING_DESC_F_WRITE) == want_write)
+			return idx;
+
+		if (!(d->flags & __SMOLKVM_VRING_DESC_F_NEXT))
+			return -1;
+
+		if (++steps > chain->num)
+			return -1;
+
+		idx = d->next;
+	}
+
+	return -1;
+}
+
+/* Read up to `len` bytes out of the readable half; returns how many it got */
+static size_t __smolkvm_virtq_chain_read(const struct smolkvm_vm *vm,
+					 struct __smolkvm_virtq_chain *chain,
+					 void *dst, size_t len)
+{
+	uint8_t *out = dst;
+	size_t done = 0;
+
+	while (done < len) {
+		const struct __smolkvm_vring_desc *d;
+		size_t take;
+		void *src;
+
+		chain->out_idx = __smolkvm_virtq_chain_next(chain, chain->out_idx, false);
+		if (chain->out_idx < 0)
+			break;
+
+		d = &chain->desc[chain->out_idx];
+		take = d->len - chain->out_off;
+		if (take > len - done)
+			take = len - done;
+
+		src = __smolkvm_memory_ptr(vm, d->addr + chain->out_off, take);
+		if (!src)
+			break;
+
+		memcpy(out + done, src, take);
+		done += take;
+		chain->out_off += take;
+
+		if (chain->out_off == d->len) {
+			chain->out_off = 0;
+			chain->out_idx = (d->flags & __SMOLKVM_VRING_DESC_F_NEXT)
+					 ? (int) d->next : -1;
+		}
+	}
+
+	return done;
+}
+
+/* ...and the same into the writable half, counting what the used ring reports */
+static size_t __smolkvm_virtq_chain_write(const struct smolkvm_vm *vm,
+					  struct __smolkvm_virtq_chain *chain,
+					  const void *src, size_t len)
+{
+	const uint8_t *in = src;
+	size_t done = 0;
+
+	while (done < len) {
+		const struct __smolkvm_vring_desc *d;
+		size_t take;
+		void *dst;
+
+		chain->in_idx = __smolkvm_virtq_chain_next(chain, chain->in_idx, true);
+		if (chain->in_idx < 0)
+			break;
+
+		d = &chain->desc[chain->in_idx];
+		take = d->len - chain->in_off;
+		if (take > len - done)
+			take = len - done;
+
+		dst = __smolkvm_memory_ptr(vm, d->addr + chain->in_off, take);
+		if (!dst)
+			break;
+
+		memcpy(dst, in + done, take);
+		done += take;
+		chain->in_off += take;
+		chain->written += take;
+
+		if (chain->in_off == d->len) {
+			chain->in_off = 0;
+			chain->in_idx = (d->flags & __SMOLKVM_VRING_DESC_F_NEXT)
+					? (int) d->next : -1;
+		}
+	}
+
+	return done;
+}
+
+
+static void __smolkvm_virtio_mmio_reset(struct smolkvm_vm *vm,
+					struct __smolkvm_virtio_mmio *dev)
+{
+	__smolkvm_debug("virtio: device %u reset\n", dev->device_id);
+
+	if (dev->reset)
+		dev->reset(vm, dev);
+
+	memset(dev->vq, 0, dev->num_vq * sizeof(*dev->vq));
+
+	dev->status = 0;
+	dev->driver_features = 0;
+	dev->driver_features_sel = 0;
+	dev->device_features_sel = 0;
+	dev->queue_sel = 0;
+	dev->interrupt_status = 0;
+
+	__smolkvm_virtio_update_irq(vm, dev);
+}
+
+static uint64_t __smolkvm_virtio_mmio_read(struct smolkvm_vm *vm,
+					   struct smolkvm_mmio *mmio,
+					   uint64_t offset, uint8_t len)
+{
+	struct __smolkvm_virtio_mmio *dev = mmio->priv;
+
+	/* The configuration space is the one part read at other widths */
+	if (offset >= __SMOLKVM_VIRTIO_MMIO_CONFIG) {
+		uint64_t off = offset - __SMOLKVM_VIRTIO_MMIO_CONFIG;
+		uint64_t val = 0;
+
+		if (!dev->config || off + len > dev->config_len)
+			return 0;
+
+		memcpy(&val, (const uint8_t *) dev->config + off, len);
+
+		return val;
+	}
+
+	if (len != 4)
+		return 0;
+
+	switch (offset) {
+	case __SMOLKVM_VIRTIO_MMIO_MAGIC:
+		return __SMOLKVM_VIRTIO_MMIO_MAGIC_VALUE;
+	case __SMOLKVM_VIRTIO_MMIO_VERSION:
+		return __SMOLKVM_VIRTIO_MMIO_VERSION_VALUE;
+	case __SMOLKVM_VIRTIO_MMIO_DEVICE_ID:
+		return dev->device_id;
+	case __SMOLKVM_VIRTIO_MMIO_VENDOR_ID:
+		return __SMOLKVM_VIRTIO_MMIO_VENDOR_VALUE;
+	case __SMOLKVM_VIRTIO_MMIO_DEVICE_FEATURES:
+		/* Read 32 bits at a time, which half chosen by the SEL register */
+		if (dev->device_features_sel > 1)
+			return 0;
+		return (dev->device_features
+			>> (dev->device_features_sel * 32)) & 0xFFFFFFFF;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_NUM_MAX:
+		if (dev->queue_sel >= dev->num_vq)
+			return 0;
+		return dev->queue_sz;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_READY:
+		if (dev->queue_sel >= dev->num_vq)
+			return 0;
+		return dev->vq[dev->queue_sel].ready ? 1 : 0;
+	case __SMOLKVM_VIRTIO_MMIO_INTERRUPT_STATUS:
+		return dev->interrupt_status;
+	case __SMOLKVM_VIRTIO_MMIO_STATUS:
+		return dev->status;
+	case __SMOLKVM_VIRTIO_MMIO_SHM_LEN_LOW:
+	case __SMOLKVM_VIRTIO_MMIO_SHM_LEN_HIGH:
+		/*
+		 * There are no shared memory regions here, and "no such region"
+		 * is spelled with a length of -1. Saying 0 instead -- which is
+		 * what an unhandled register would -- reads as a region that
+		 * exists and is empty, and the gpu driver fails to probe trying
+		 * to reserve it. The driver asks whatever features were
+		 * negotiated, so this is not optional.
+		 */
+		return 0xFFFFFFFF;
+	case __SMOLKVM_VIRTIO_MMIO_SHM_BASE_LOW:
+	case __SMOLKVM_VIRTIO_MMIO_SHM_BASE_HIGH:
+		return 0;
+	case __SMOLKVM_VIRTIO_MMIO_CONFIG_GENERATION:
+		/* Nothing changes the config behind the driver's back */
+		return 0;
+	}
+
+	__smolkvm_debug("virtio: read from unknown offset 0x%llx\n",
+			(unsigned long long) offset);
+
+	return 0;
+}
+
+static void __smolkvm_virtio_mmio_write(struct smolkvm_vm *vm,
+					struct smolkvm_mmio *mmio,
+					uint64_t offset, uint8_t len, uint64_t value)
+{
+	struct __smolkvm_virtio_mmio *dev = mmio->priv;
+	uint32_t val = (uint32_t) value;
+	struct __smolkvm_virtq *vq;
+
+	if (offset >= __SMOLKVM_VIRTIO_MMIO_CONFIG) {
+		uint64_t off = offset - __SMOLKVM_VIRTIO_MMIO_CONFIG;
+
+		if (dev->config_write && dev->config && off + len <= dev->config_len)
+			dev->config_write(vm, dev, off, len, value);
+
+		return;
+	}
+
+	if (len != 4)
+		return;
+
+	/* The registers that are about the device as a whole */
+	switch (offset) {
+	case __SMOLKVM_VIRTIO_MMIO_DEVICE_FEATURES_SEL:
+		dev->device_features_sel = val;
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_DRIVER_FEATURES:
+		/* Replace that half rather than merging into it: the driver is
+		 * allowed to write a word twice, and the second one is the one
+		 * it means. */
+		if (dev->driver_features_sel <= 1) {
+			unsigned int shift = dev->driver_features_sel * 32;
+
+			dev->driver_features &= ~(0xFFFFFFFFULL << shift);
+			dev->driver_features |= (uint64_t) val << shift;
+		}
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_DRIVER_FEATURES_SEL:
+		dev->driver_features_sel = val;
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_SEL:
+		dev->queue_sel = val;
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_SHM_SEL:
+		/* Whichever region is asked after, the answer is "there isn't one" */
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_INTERRUPT_ACK:
+		dev->interrupt_status &= ~val;
+		__smolkvm_virtio_update_irq(vm, dev);
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_NOTIFY:
+		/* The queue is the value written, not whichever one is selected */
+		if (val < dev->num_vq && dev->notify)
+			dev->notify(vm, dev, val);
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_STATUS:
+		/* A zero write is the reset, from the driver or from a reboot */
+		if (!val) {
+			__smolkvm_virtio_mmio_reset(vm, dev);
+			return;
+		}
+
+		/*
+		 * This transport only speaks the modern protocol, so a driver
+		 * that will not take VERSION_1 is told it cannot have the
+		 * device rather than being let through to a ring layout we do
+		 * not implement.
+		 */
+		if ((val & __SMOLKVM_VIRTIO_STATUS_FEATURES_OK) &&
+		    !(dev->driver_features & __SMOLKVM_VIRTIO_F_VERSION_1)) {
+			printf("virtio: the driver did not negotiate VERSION_1; "
+			       "refusing to come up\n");
+			dev->status = val | __SMOLKVM_VIRTIO_STATUS_FAILED;
+			dev->status &= ~__SMOLKVM_VIRTIO_STATUS_FEATURES_OK;
+			return;
+		}
+
+		dev->status = val;
+		return;
+	}
+
+	/* ...and everything left is about the selected queue, if it exists */
+	if (dev->queue_sel >= dev->num_vq)
+		return;
+
+	vq = &dev->vq[dev->queue_sel];
+
+	switch (offset) {
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_NUM:
+		if (val && val <= dev->queue_sz)
+			vq->num = val;
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_READY:
+		vq->ready = val & 1;
+		if (vq->ready)
+			vq->last_avail = 0;
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_DESC_LOW:
+		vq->desc_gpa = (vq->desc_gpa & ~0xFFFFFFFFULL) | val;
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_DESC_HIGH:
+		vq->desc_gpa = (vq->desc_gpa & 0xFFFFFFFFULL) | ((uint64_t) val << 32);
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_AVAIL_LOW:
+		vq->avail_gpa = (vq->avail_gpa & ~0xFFFFFFFFULL) | val;
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_AVAIL_HIGH:
+		vq->avail_gpa = (vq->avail_gpa & 0xFFFFFFFFULL) | ((uint64_t) val << 32);
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_USED_LOW:
+		vq->used_gpa = (vq->used_gpa & ~0xFFFFFFFFULL) | val;
+		return;
+	case __SMOLKVM_VIRTIO_MMIO_QUEUE_USED_HIGH:
+		vq->used_gpa = (vq->used_gpa & 0xFFFFFFFFULL) | ((uint64_t) val << 32);
+		return;
+	}
+
+	__smolkvm_debug("virtio: write to unknown offset 0x%llx\n",
+			(unsigned long long) offset);
+}
+
+/*
+ * The registers a generated header should describe. Every virtio-mmio device
+ * has the same window, so they all share this.
+ */
+static const struct smolkvm_mmio_reg __smolkvm_virtio_mmio_regs[] = {
+	{ .name = "MAGIC",            .offset = __SMOLKVM_VIRTIO_MMIO_MAGIC,            .size = 4 },
+	{ .name = "VERSION",          .offset = __SMOLKVM_VIRTIO_MMIO_VERSION,          .size = 4 },
+	{ .name = "DEVICE_ID",        .offset = __SMOLKVM_VIRTIO_MMIO_DEVICE_ID,        .size = 4 },
+	{ .name = "VENDOR_ID",        .offset = __SMOLKVM_VIRTIO_MMIO_VENDOR_ID,        .size = 4 },
+	{ .name = "STATUS",           .offset = __SMOLKVM_VIRTIO_MMIO_STATUS,           .size = 4 },
+	{ .name = "QUEUE_NOTIFY",     .offset = __SMOLKVM_VIRTIO_MMIO_QUEUE_NOTIFY,     .size = 4 },
+	{ .name = "INTERRUPT_STATUS", .offset = __SMOLKVM_VIRTIO_MMIO_INTERRUPT_STATUS, .size = 4 },
+	{ .name = "INTERRUPT_ACK",    .offset = __SMOLKVM_VIRTIO_MMIO_INTERRUPT_ACK,    .size = 4 },
+	{ .name = "CONFIG",           .offset = __SMOLKVM_VIRTIO_MMIO_CONFIG,           .size = 4 },
+};
+
+
+#endif /* SMOLKVM_WANT_VIRTIO */
 #endif
 /* -- */
 
