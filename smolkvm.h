@@ -262,6 +262,17 @@ struct smolkvm_mmio {
 };
 
 
+#ifdef SMOLKVM_WANT_GDB_STUB
+struct smolkvm_gdb_stub {
+	int listen_socket;
+	int conn_socket;
+
+	/* Are we waiting for GDB to tell us to run ? */
+	bool stopped;
+	bool single_stepping;
+};
+#endif
+
 struct smolkvm_vm {
 	int vcpu_fd;
 	int kvm_fd;
@@ -279,6 +290,9 @@ struct smolkvm_vm {
 	unsigned int mmio_plugged_in;
 
 
+#ifdef SMOLKVM_WANT_GDB_STUB
+	struct smolkvm_gdb_stub gdb_stub;
+#endif
 	bool was_interrupted;
 };
 
@@ -1367,6 +1381,234 @@ int smolkvm_guest_write(struct smolkvm_vm *vm, uint64_t gpa, uint64_t len, const
 
 #endif
 /* -- */
+
+/* GDB stuff 2 */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_GDB_STUB
+static inline int __smolkvm_gdb_stub_start(struct smolkvm_vm *vm)
+{
+	struct smolkvm_gdb_stub *gdb_stub = &vm->gdb_stub;
+	int port = 1234;
+	int ret;
+
+	ret = __smolkvm_create_server_socket(port);
+	if (ret < 0)
+		return ret;
+
+	gdb_stub->listen_socket = ret;
+	gdb_stub->stopped = true;
+
+	return 0;
+}
+
+static inline int __smolkvm_gdb_stub_accept(struct smolkvm_vm *vm)
+{
+	int listen_socket = vm->gdb_stub.listen_socket;
+	struct sockaddr_in client_addr;
+	socklen_t addr_len = sizeof(client_addr);
+	int conn_socket;
+	int ret;
+
+	while (true) {
+		ret = accept4(listen_socket, (struct sockaddr *)&client_addr, &addr_len, O_NONBLOCK);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+
+			printf("accept failed: %d, errno %d\n", ret, errno);
+			return -errno;
+		}
+		break;
+	}
+
+	conn_socket = ret;
+	__smolkvm_make_socket_trigger_sigio(conn_socket);
+
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("accepted connection\n");
+#endif
+
+	vm->gdb_stub.conn_socket = conn_socket;
+
+	return 0;
+}
+
+static inline int __smolkvm_gdb_wait_for_data(const struct smolkvm_vm *vm)
+{
+	struct pollfd pfd = {
+		.fd = vm->gdb_stub.conn_socket,
+		.events = POLLIN,
+		.revents = 0,
+	};
+	int ret;
+
+	ret = poll(&pfd, 1, -1);
+	if (ret < 0)
+		return -1;
+	if (ret == 0)
+		return 0;
+
+	if (pfd.revents & POLLIN)
+		return 1;
+
+	return -1;
+}
+
+static inline int __smolkvm_gdb_stub_read_packet(struct smolkvm_vm *vm,
+						  struct smolkvm_gdb_stub_pkt *pkt)
+{
+	int conn_socket = vm->gdb_stub.conn_socket;
+	unsigned char buff[2049] = {0};
+	unsigned char chk[3] = { 0 };
+	/* Did we see the $ yet? */
+	bool packet_started = false;
+	unsigned int len = 0;
+	int ret;
+
+	while (len < (sizeof(buff) - 1)) {
+		unsigned char sym;
+
+		ret = read(conn_socket, &sym, 1);
+		if (ret == 0)
+			/* The debugger closed the connection */
+			return -1;
+		if (ret != 1)
+			break;
+
+		if (!packet_started) {
+			if (sym == __smolkvm_gdb_stub_pktstart)
+				packet_started = true;
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+			else
+				printf("packet not started, received something that wasn't start character: %c\n", sym);
+#endif
+
+			continue;
+		}
+
+		if (sym == __smolkvm_gdb_stub_pktend) {
+			unsigned int got = 0;
+
+			/*
+			 * The trailer is exactly two hex digits; reading any
+			 * more would steal bytes from a pipelined packet.
+			 * They might not have arrived yet (non-blocking
+			 * socket), so keep trying.
+			 */
+			while (got < 2) {
+				ret = read(conn_socket, chk + got, 2 - got);
+				if (ret == 0)
+					return -1;
+				if (ret > 0)
+					got += ret;
+				else if (errno != EAGAIN && errno != EINTR)
+					break;
+			}
+			break;
+		}
+
+		buff[len++] = sym;
+	}
+
+	if (!len)
+		return 0;
+
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("have %d bytes of packet data, raw data %s\n", len, buff);
+#endif
+
+	if (__smolkvm_gdb_stub_pkt_checksum(buff, len, chk)) {
+		__smolkvm_gdb_stub_pkt_unpack(buff, len, pkt);
+		ret = write(conn_socket, &__smolkvm_gdb_stub_ack, 1);
+		return 1;
+	}
+	else
+		ret = write(conn_socket, &__smolkvm_gdb_stub_nak, 1);
+
+	return 0;
+}
+
+#define __smolkvm_gdb_stub_write_const(_sock, _const) \
+	write(_sock, &_const, sizeof(_const))
+
+/*
+ * This is a workaround to the problem with nolibc's sprintf() not being able to
+ * do left padding yet. I guess it might be a bit quicker too?
+ */
+static inline unsigned char __smolkvm_gdb_stub_nibbletohex(uint8_t nibble)
+{
+	const unsigned char table[] = {'0', '1', '2', '3', '4', '5', '6', '7',
+				       '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+
+	return table[nibble];
+}
+
+static inline void __smolkvm_gdb_u8tohex(char *output, uint8_t value)
+{
+	*output++ = __smolkvm_gdb_stub_nibbletohex((value >> 4) & 0xf);
+	*output = __smolkvm_gdb_stub_nibbletohex(value & 0xf);
+}
+
+/* FIXME: change argument order? use the u8 function in the loop ? */
+static inline void __smolkvm_gdb_u64tohex(uint64_t value, char *output)
+{
+	int i;
+
+	for (i = 0; i < 64; i += 8) {
+		uint8_t byte = (value >> i) & 0xff;
+		__smolkvm_gdb_u8tohex(output, byte);
+		output += 2;
+	}
+}
+
+static inline void __smolkvm_gdb_u32tohex(uint32_t value, char *output)
+{
+	int i;
+
+	for (i = 0; i < 32; i += 8) {
+		uint8_t byte = (value >> i) & 0xff;
+		__smolkvm_gdb_u8tohex(output, byte);
+		output += 2;
+	}
+}
+
+static inline void __smolkvm_gdb_stub_send_packet(struct smolkvm_vm *vm,
+						  const char *data,
+						  unsigned int len)
+{
+	int conn_socket = vm->gdb_stub.conn_socket;
+	unsigned char chk[3] = { 0 };
+	unsigned char resp;
+	int ret;
+
+	__smolkvm_gdb_u8tohex(chk, __smolkvm_gdb_stub_checksum(data, len));
+
+	ret = __smolkvm_gdb_stub_write_const(conn_socket, __smolkvm_gdb_stub_pktstart);
+	if (ret != 1)
+		return;
+
+	ret = write(conn_socket, data, len);
+	if (ret != len){
+		printf("whelp\n");
+	}
+
+	ret = __smolkvm_gdb_stub_write_const(conn_socket, __smolkvm_gdb_stub_pktend);
+
+	ret = write(conn_socket, chk, sizeof(chk) - 1);
+
+
+	__smolkvm_gdb_wait_for_data(vm);
+	ret = read(conn_socket, &resp, 1);
+	if (ret != 1)
+		return;
+
+#ifdef SMOLKVM_WANT_GDB_STUB_DEBUG
+	printf("response to sent packet: \'%c\'\n", resp);
+#endif
+}
+
+#endif /* SMOLKVM_WANT_GDB_STUB */
+#endif /* fold */
 
 /* Early CPU init stuff, switch to longmode, initial guest page tables etc */
 #ifdef SMOLKVM_FOLD
