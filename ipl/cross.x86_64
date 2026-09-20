@@ -1,0 +1,15 @@
+[binaries]
+c = 'gcc'
+ar = 'ar'
+ld = 'ld'
+objcopy = 'objcopy'
+
+[host_machine]
+system = 'none'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+
+[built-in options]
+c_args = ['-ffreestanding', '-fno-pie' ]
+c_link_args = ['-static', '-no-pie', '-nostdlib']
