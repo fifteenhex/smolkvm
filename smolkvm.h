@@ -54,6 +54,7 @@
  *   SMOLKVM_DEBUG                -- Be very noisy about what is going on to help with working out what is broken.
  *   SMOLKVM_MEMREGIONS_NUM       -- How many memory regions are possible, see default below.
  *   SMOLKVM_MMIOREGIONS_NUM      -- How many mmio, device, regions are possible, see default below.
+ *   SMOLKVM_WANT_SIMPLE          -- Machine with the simple polled irqchip + timer (default).
  */
 #ifdef SMOLKVM_FOLD
 
@@ -68,6 +69,25 @@
 #ifndef SMOLKVM_MAILBOX_HANDLERS_NUM
 #define SMOLKVM_MAILBOX_HANDLERS_NUM	16
 #endif
+
+/*
+ * Machine type. Both machines have the console and mailbox; they differ only in
+ * the interrupt + timer hardware:
+ *
+ *   SMOLKVM_WANT_SIMPLE -- the simple polled MMIO irqchip + timer, for
+ *                          bare-metal guests (the default).
+ *   SMOLKVM_WANT_APIC   -- the in-kernel APIC/IOAPIC/PIC + 8254 PIT that a
+ *                          stock OS such as Linux expects.
+ *
+ * Define one; SIMPLE is assumed if neither is given.
+ */
+#if defined(SMOLKVM_WANT_SIMPLE) && defined(SMOLKVM_WANT_APIC)
+#error "smolkvm: define only one of SMOLKVM_WANT_SIMPLE or SMOLKVM_WANT_APIC"
+#endif
+#if !defined(SMOLKVM_WANT_SIMPLE) && !defined(SMOLKVM_WANT_APIC)
+#define SMOLKVM_WANT_SIMPLE
+#endif
+/* -- */
 
 /* Utility macros */
 #define SMOLKVM_ARRAYSIZE(_a)	(sizeof(_a)/sizeof(_a[0]))
@@ -1527,6 +1547,142 @@ static inline int __smolkvm_mailbox_create(struct smolkvm_vm *vm)
 #endif
 /* -- */
 
+/* Interrupt controller: a very basic 64-line IRQ status/mask/ack device */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_SIMPLE
+
+/*
+ * A minimal MMIO interrupt controller for up to 64 interrupt lines. It is a
+ * *polled* controller: it latches pending lines and exposes them to the guest,
+ * but does not (yet) inject anything into the vCPU -- the guest reads STATUS to
+ * see what needs servicing. The host (or another device) asserts a line with
+ * smolkvm_irq_raise().
+ *
+ * Each line is one bit, so all 64 fit in a single 64-bit register.
+ *
+ * Register map (all registers are 64-bit):
+ *   0x00  STATUS  (read)   asserted lines == pending & ~mask
+ *   0x08  MASK    (r/w)    a 1 bit masks (suppresses) that line
+ *   0x10  ACK     (write)  write a 1 bit to clear that pending line
+ */
+#define SMOLKVM_IRQCHIP_PHYS	(SMOLKVM_MMIO_HOLE_PHYS + 0x2000)
+#define SMOLKVM_IRQCHIP_LEN	0x20
+#define SMOLKVM_IRQCHIP_MAX_IRQ	64
+
+#define __SMOLKVM_IRQCHIP_REG_STATUS	0x00
+#define __SMOLKVM_IRQCHIP_REG_MASK	0x08
+#define __SMOLKVM_IRQCHIP_REG_ACK	0x10
+
+struct __smolkvm_irqchip_priv {
+	uint64_t pending;	/* latched lines, set by raise, cleared by ACK */
+	uint64_t mask;	/* bit set => line is masked (suppressed) */
+};
+
+static struct __smolkvm_irqchip_priv __smolkvm_irqchip_priv;
+
+static uint64_t __smolkvm_irqchip_read(struct smolkvm_vm *vm,
+									   struct smolkvm_mmio *mmio,
+									   uint64_t offset,
+									   uint8_t len)
+{
+	struct __smolkvm_irqchip_priv *ic = mmio->priv;
+
+	switch (offset) {
+	case __SMOLKVM_IRQCHIP_REG_STATUS:
+		/* Only report lines that are pending *and* not masked */
+		return ic->pending & ~ic->mask;
+	case __SMOLKVM_IRQCHIP_REG_MASK:
+		return ic->mask;
+	}
+
+	return 0;
+}
+
+static void __smolkvm_irqchip_write(struct smolkvm_vm *vm,
+									struct smolkvm_mmio *mmio,
+									uint64_t offset,
+									uint8_t len,
+									uint64_t value)
+{
+	struct __smolkvm_irqchip_priv *ic = mmio->priv;
+
+	switch (offset) {
+	case __SMOLKVM_IRQCHIP_REG_MASK:
+		ic->mask = value;
+		break;
+	case __SMOLKVM_IRQCHIP_REG_ACK:
+		/* Clear every pending line the guest acknowledged */
+		ic->pending &= ~value;
+		break;
+	default:
+		__smolkvm_debug("irqchip: write to read-only/unknown offset 0x%llx\n",
+						(unsigned long long) offset);
+		break;
+	}
+}
+
+static const struct smolkvm_mmio_reg __smolkvm_irqchip_regs[] = {
+	{ .name = "STATUS", .offset = __SMOLKVM_IRQCHIP_REG_STATUS, .size = 8 },
+	{ .name = "MASK",   .offset = __SMOLKVM_IRQCHIP_REG_MASK,   .size = 8 },
+	{ .name = "ACK",    .offset = __SMOLKVM_IRQCHIP_REG_ACK,    .size = 8 },
+};
+
+static struct smolkvm_mmio __smolkvm_irqchip = {
+	.name = "irqchip",
+	.phys = SMOLKVM_IRQCHIP_PHYS,
+	.len = SMOLKVM_IRQCHIP_LEN,
+	.regs = __smolkvm_irqchip_regs,
+	.num_regs = SMOLKVM_ARRAYSIZE(__smolkvm_irqchip_regs),
+	.write = __smolkvm_irqchip_write,
+	.read = __smolkvm_irqchip_read,
+	.priv = &__smolkvm_irqchip_priv,
+};
+
+/* Assert interrupt line `irq` (latches even if currently masked) */
+void smolkvm_irq_raise(struct smolkvm_vm *vm, unsigned int irq)
+{
+	(void) vm;
+
+	if (irq >= SMOLKVM_IRQCHIP_MAX_IRQ) {
+		printf("irq %u out of range (max %d)\n", irq, SMOLKVM_IRQCHIP_MAX_IRQ);
+		return;
+	}
+
+	__smolkvm_irqchip_priv.pending |= SMOLKVM_BIT(irq);
+}
+
+/* Deassert interrupt line `irq` without the guest having to ACK it */
+void smolkvm_irq_lower(struct smolkvm_vm *vm, unsigned int irq)
+{
+	(void) vm;
+
+	if (irq >= SMOLKVM_IRQCHIP_MAX_IRQ)
+		return;
+
+	__smolkvm_irqchip_priv.pending &= ~SMOLKVM_BIT(irq);
+}
+
+/* True if any line is asserted (pending and unmasked) -- the hook a real
+ * delivery path would use to decide whether to inject into the vCPU. */
+static inline bool smolkvm_irq_asserted(struct smolkvm_vm *vm)
+{
+	(void) vm;
+
+	return (__smolkvm_irqchip_priv.pending & ~__smolkvm_irqchip_priv.mask) != 0;
+}
+
+static inline int __smolkvm_irqchip_create(struct smolkvm_vm *vm)
+{
+	__smolkvm_irqchip_priv.pending = 0;
+	__smolkvm_irqchip_priv.mask = 0;	/* nothing masked by default */
+
+	return __smolkvm_plugin_mmio(vm, &__smolkvm_irqchip);
+}
+
+#endif /* SMOLKVM_WANT_SIMPLE */
+#endif
+/* -- */
+
 /* VM creation and teardown */
 #ifdef SMOLKVM_FOLD
 
@@ -1664,6 +1820,11 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 
 	/* Plug in the mailbox so the guest can ask us to do things */
 	__smolkvm_mailbox_create(vm);
+
+#ifdef SMOLKVM_WANT_SIMPLE
+	/* Plug in the interrupt controller */
+	__smolkvm_irqchip_create(vm);
+#endif
 
 	return 0;
 }
