@@ -101,6 +101,7 @@
 #define SMOLKVM_ERR_CREATE_GETREGS  110
 #define SMOLKVM_ERR_CREATE_SETREGS  111
 #define SMOLKVM_ERR_MMIO_NO_DEVICE  112
+#define SMOLKVM_ERR_UNHANDLED_EXIT  113
 #define SMOLKVM_ERR_GET_CPUID       114
 #define SMOLKVM_ERR_SET_CPUID       115
 
@@ -974,6 +975,176 @@ void smolkvm_destroy_vm(struct smolkvm_vm *vm)
 	close(vm->vcpu_fd);
 	close(vm->vm_fd);
 	close(vm->kvm_fd);
+}
+
+#endif
+/* -- */
+
+static const char *smolkvm_exit_reasons[] = {
+	[KVM_EXIT_UNKNOWN] = "UNKNOWN",
+	[KVM_EXIT_EXCEPTION] = "EXCEPTION",
+	[KVM_EXIT_IO] = "IO",
+	[KVM_EXIT_HYPERCALL] = "HYPERCALL",
+	[KVM_EXIT_DEBUG] = "DEBUG",
+	[KVM_EXIT_HLT] = "HLT",
+	[KVM_EXIT_MMIO] = "MMIO",
+	[KVM_EXIT_IRQ_WINDOW_OPEN] = "IRQ_WINDOW_OPEN",
+	[KVM_EXIT_SHUTDOWN] = "SHUTDOWN",
+	[KVM_EXIT_FAIL_ENTRY] = "FAIL_ENTRY",
+	[KVM_EXIT_INTR] = "INTR",
+	[KVM_EXIT_SET_TPR] = "SET_TPR",
+	[KVM_EXIT_TPR_ACCESS] = "TPR_ACCESS",
+	[KVM_EXIT_NMI] = "NMI",
+	[KVM_EXIT_INTERNAL_ERROR] = "INTERNAL_ERROR",
+	[KVM_EXIT_WATCHDOG] = "WATCHDOG",
+	[KVM_EXIT_SYSTEM_EVENT] = "SYSTEM_EVENT",
+	[KVM_EXIT_IOAPIC_EOI] = "IOAPIC_EOI",
+};
+
+/* KVM grows exit reasons; the table above is sparse and ends early */
+static inline const char *__smolkvm_exit_reason_str(uint32_t exit_reason)
+{
+	if (exit_reason >= SMOLKVM_ARRAYSIZE(smolkvm_exit_reasons) ||
+	    !smolkvm_exit_reasons[exit_reason])
+		return "??";
+
+	return smolkvm_exit_reasons[exit_reason];
+}
+
+int smolkvm_run(struct smolkvm_vm *vm)
+{
+	int ret;
+	uint32_t exit_reason;
+
+	ret = __smolkvm_run(vm);
+	if (ret) {
+		if (ret == 1) {
+			vm->was_interrupted = true;
+			return 0;
+		}
+
+		return ret;
+	}
+
+	exit_reason = vm->vcpu_run->exit_reason;
+
+	__smolkvm_debug("exit: %s\n", __smolkvm_exit_reason_str(exit_reason));
+	__smolkvm_debug_dump_regs(&vm->vcpu_run->s.regs.regs);
+	__smolkvm_debug_dump_sregs(&vm->vcpu_run->s.regs.sregs);
+
+	switch (vm->vcpu_run->exit_reason) {
+	case KVM_EXIT_FAIL_ENTRY:
+		printf("VM entry failed! Reason: 0x%llx\n",
+			vm->vcpu_run->fail_entry.hardware_entry_failure_reason);
+		/* This is bad, abort abort! */
+		return -1;
+	case KVM_EXIT_HLT:
+		break;
+	case KVM_EXIT_SHUTDOWN:
+		return -1;
+	case KVM_EXIT_MMIO:
+		ret = __smolkvm_handle_mmio(vm);
+		if (ret)
+			return ret;
+		break;
+	case KVM_EXIT_IO:
+		ret = __smolkvm_handle_io(vm);
+		if (ret)
+			return ret;
+		break;
+	case KVM_EXIT_DEBUG:
+		/* GDB single-step / breakpoint: let the default loop handle it */
+		break;
+	default:
+		/*
+		 * Anything we don't explicitly recognise (internal errors, a
+		 * fault that couldn't be delivered, stray IO, ...) stops the VM
+		 * rather than silently re-entering KVM_RUN and livelocking.
+		 */
+		printf("unhandled exit reason %u, stopping the VM\n", exit_reason);
+		return -SMOLKVM_ERR_UNHANDLED_EXIT;
+	}
+
+	return 0;
+}
+
+static bool __smolkvm_stopped(const struct smolkvm_vm *vm)
+{
+	return false;
+}
+
+static void __smolkvm_stop(struct smolkvm_vm *vm)
+{
+}
+
+static void __smolkvm_default_loop_pre_run(struct smolkvm_vm *vm)
+{
+	struct smolkvm_mmio **mmio;
+
+	__smolkvm_foreach_mmio(vm, mmio) {
+		if ((*mmio)->pre_run)
+			(*mmio)->pre_run(vm, *mmio);
+	}
+
+}
+
+static bool __smolkvm_is_single_stepping(struct smolkvm_vm *vm)
+{
+	return false;
+}
+
+static int __smolkvm_default_loop_configure_run(struct smolkvm_vm *vm)
+{
+	return 0;
+}
+
+static void __smolkvm_default_loop_post_run(struct smolkvm_vm *vm)
+{
+	struct smolkvm_mmio **mmio;
+
+	__smolkvm_foreach_mmio(vm, mmio) {
+		if ((*mmio)->post_run)
+			(*mmio)->post_run(vm, *mmio);
+	}
+
+}
+
+/* Default loop for running the VM */
+#ifdef SMOLKVM_FOLD
+
+int smolkvm_default_loop(struct smolkvm_vm *vm)
+{
+	int ret;
+
+	while (true) {
+		/* Any pre-run work, like handling for GDB packets */
+		__smolkvm_default_loop_pre_run(vm);
+
+		/* Check if we should actually do the run or not */
+		if (!__smolkvm_stopped(vm)) {
+			/* Setup things like single step */
+			ret = __smolkvm_default_loop_configure_run(vm);
+			if (ret)
+				return ret;
+
+			/* Do the actual kvm run bit */
+			ret = smolkvm_run(vm);
+			if (ret)
+				return ret;
+
+			/* CHECKME set the stopped flag, what we actually should do here depends on the exit reason */
+			if (__smolkvm_is_single_stepping(vm))
+				__smolkvm_stop(vm);
+		}
+
+		/* Any post-run work, like handling GDB packets */
+		__smolkvm_default_loop_post_run(vm);
+
+		/* Clear any flags from the last run */
+		vm->was_interrupted = false;
+	}
+
+	return ret;
 }
 
 #endif
