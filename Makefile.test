@@ -1,0 +1,73 @@
+# A Linux kernel to test with: download a release tarball, unpack it into the
+# build directory and build a minimal vmlinux from the shipped config.
+#
+#   make -f Makefile.test kernel      # just build vmlinux
+#   make -f Makefile.test clean       # drop build products, keep the downloads
+#   make -f Makefile.test distclean   # drop the build directory entirely
+#
+# Nothing checked in lives under the build directory, so deleting it is always
+# safe: the kernel config fragments the build needs are in test/.
+#
+# Needs, on Debian / Ubuntu:
+#   build-essential flex bison bc libelf-dev libssl-dev   # kernel (libelf is
+#                                                          # for objtool)
+
+# TESTDIR is checked in and must survive; BUILDDIR is everything downloaded,
+# unpacked, cloned or built and can be deleted at any time to start over.
+TESTDIR  := test
+BUILDDIR := build
+
+# An -rc: the userspace built against this kernel's nolibc wants a getcwd(),
+# which only landed after 7.2. Release tarballs live under cdn.kernel.org/pub/linux/kernel/vX.x/
+# and -rc ones are generated on demand at git.kernel.org/torvalds/t/, where they
+# are also dropped again once the next -rc lands -- so this needs bumping now
+# and then until 7.3 is out and it can go back to a release.
+KERNEL_VERSION := 7.3-rc3
+KERNEL_SRC     := $(BUILDDIR)/linux-$(KERNEL_VERSION)
+KERNEL_TARBALL := $(BUILDDIR)/linux-$(KERNEL_VERSION).tar.gz
+KERNEL_URL     := https://git.kernel.org/torvalds/t/linux-$(KERNEL_VERSION).tar.gz
+KERNEL_STAMP   := $(BUILDDIR)/.linux-$(KERNEL_VERSION).extracted
+
+# Out-of-tree build so re-extracting is never needed and the source stays clean.
+KOUT    := $(CURDIR)/$(KERNEL_SRC)/smolkvm-build
+VMLINUX := $(KOUT)/vmlinux
+CONFIG  := $(CURDIR)/$(TESTDIR)/kernel.config
+
+NPROC := $(shell nproc 2>/dev/null || echo 1)
+
+# --- kernel source -----------------------------------------------------------
+
+$(KERNEL_TARBALL):
+	mkdir -p $(BUILDDIR)
+	curl -fL --retry 3 --retry-delay 2 -o $@.tmp '$(KERNEL_URL)'
+	mv $@.tmp $@
+
+$(KERNEL_STAMP): $(KERNEL_TARBALL)
+	rm -rf $(KERNEL_SRC)
+	tar -C $(BUILDDIR) -xf $(KERNEL_TARBALL)
+	touch $@
+
+kernel-src: $(KERNEL_STAMP)
+.PHONY: kernel-src
+
+# --- vmlinux -----------------------------------------------------------------
+
+$(VMLINUX): $(KERNEL_STAMP) $(CONFIG)
+	$(MAKE) -C $(KERNEL_SRC) O=$(KOUT) allnoconfig KCONFIG_ALLCONFIG=$(CONFIG)
+	$(MAKE) -C $(KERNEL_SRC) O=$(KOUT) -j$(NPROC) vmlinux
+
+kernel: $(VMLINUX)
+.PHONY: kernel
+
+# --- cleanup -----------------------------------------------------------------
+
+# Build products, but keep the downloaded/cloned sources.
+clean:
+	rm -rf $(KOUT)
+.PHONY: clean
+
+# Everything downloaded, unpacked, cloned or built. Nothing checked in lives
+# under there, so this is always safe and always enough.
+distclean:
+	rm -rf $(BUILDDIR)
+.PHONY: distclean

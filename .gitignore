@@ -9,3 +9,7 @@
 /smolkvm_test_apic_debug_libc
 /smolkvm_test_apic_gdb_libc
 /smolkvm_test_apic_debug_gdb_libc
+
+# Everything Makefile.test downloads, unpacks, clones or builds. Deleting this
+# is always safe; the config fragments it needs are checked in under test/.
+/build/
