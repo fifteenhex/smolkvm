@@ -54,6 +54,8 @@
  *   SMOLKVM_DEBUG                -- Be very noisy about what is going on to help with working out what is broken.
  *   SMOLKVM_MEMREGIONS_NUM       -- How many memory regions are possible, see default below.
  *   SMOLKVM_MMIOREGIONS_NUM      -- How many mmio, device, regions are possible, see default below.
+ *   SMOLKVM_WANT_GDB_STUB        -- Include a GDB remote stub for debugging.
+ *   SMOLKVM_WANT_GDB_STUB_DEBUG  -- Add noisy debug messages for the stub.
  *   SMOLKVM_WANT_SIMPLE          -- Machine with the simple polled irqchip + timer (default).
  *   SMOLKVM_WANT_APIC            -- Machine with the in-kernel APIC + PIT (boots stock OSes).
  */
@@ -491,6 +493,183 @@ err_close_sock:
 
 #endif
 /* -- */
+
+/* GDB stuff 1 */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_GDB_STUB
+/* The raw "type" characters that are at the start of the GDB packet */
+#define SMOLKVM_GDB_STUB_PKTTYPE_EXTENDED	'!'
+#define SMOLKVM_GDB_STUB_PKTTYPE_STOP_REASON	'?'
+#define SMOLKVM_GDB_STUB_PKTTYPE_CONTINUE	'c'
+#define SMOLKVM_GDB_STUB_PKTTYPE_READ_REGS	'g'
+#define SMOLKVM_GDB_STUB_PKTTYPE_H		'H'
+#define SMOLKVM_GDB_STUB_PKTTYPE_READ_MEM	'm'
+#define SMOLKVM_GDB_STUB_PKTTYPE_QUERY		'q'
+#define SMOLKVM_GDB_STUB_PKTTYPE_STEP		's'
+#define SMOLKVM_GDB_STUB_PKTTYPE_V		'v'
+
+#define SMOLKVM_GDB_TARGET_XML "<target version=\"1.0\"><architecture>i386:x86-64</architecture></target>"
+
+static const unsigned char __smolkvm_gdb_stub_ack = '+';
+static const unsigned char __smolkvm_gdb_stub_nak = '-';
+static const unsigned char __smolkvm_gdb_stub_pktstart = '$';
+static const unsigned char __smolkvm_gdb_stub_pktend = '#';
+
+static const unsigned char __smolkvm_gdb_pkt_query_attached[] = "Attached";
+static const unsigned char __smolkvm_gdb_pkt_query_support[] = "Supported:";
+static const unsigned char __smolkvm_gdb_pkt_query_xfer[] = "Xfer:features:read:";
+static const unsigned char __smolkvm_gdb_pkt_v_cont[] = "Cont?";
+static const unsigned char __smolkvm_gdb_pkt_v_mustreplyempty[] = "MustReplyEmpty";
+
+enum smolkvm_gdb_stub_type {
+	SMOLKVM_GDB_STUB_UNKNOWN,
+	SMOLKVM_GDB_STUB_STOP_REASON,
+	SMOLKVM_GDB_STUB_READ_REGS,
+	SMOLKVM_GDB_STUB_CONTINUE,
+	SMOLKVM_GDB_STUB_STEP,
+	SMOLKVM_GDB_STUB_QUERY,
+	SMOLKVM_GDB_STUB_READ_MEM,
+	SMOLKVM_GDB_STUB_H,
+	SMOLKVM_GDB_STUB_V,
+};
+
+enum smolkvm_gdb_stub_query_subtype {
+	SMOLKVM_GDB_STUB_QUERY_UNKNOWN,
+	SMOLKVM_GDB_STUB_QUERY_ATTACHED,
+	SMOLKVM_GDB_STUB_QUERY_SUPPORTED,
+	SMOLKVM_GDB_STUB_QUERY_XFER_FEATURES,
+};
+
+enum smolkvm_gdb_stub_v_subtype {
+	SMOLKVM_GDB_STUB_V_CONT,
+	SMOLKVM_GDB_STUB_V_MUSTREPLYEMPTY,
+	SMOLKVM_GDB_STUB_V_UNKNOWN,
+};
+
+struct smolkvm_gdb_stub_pkt_query {
+	enum smolkvm_gdb_stub_query_subtype subtype;
+};
+
+struct smolkvm_gdb_stub_pkt_h {
+	int subtype;
+};
+
+struct smolkvm_gdb_stub_pkt_v {
+	enum smolkvm_gdb_stub_v_subtype subtype;
+};
+
+struct smolkvm_gdb_stub_pkt_read_mem {
+	uint64_t addr;
+	uint64_t len;
+};
+
+struct smolkvm_gdb_stub_pkt {
+	enum smolkvm_gdb_stub_type type;
+	union {
+		struct smolkvm_gdb_stub_pkt_query query;
+		struct smolkvm_gdb_stub_pkt_h h;
+		struct smolkvm_gdb_stub_pkt_v v;
+		struct smolkvm_gdb_stub_pkt_read_mem read_mem;
+	};
+};
+
+static inline uint8_t __smolkvm_gdb_stub_checksum(const char *data, unsigned int len)
+{
+	unsigned long long chksum = 0;
+	int i;
+
+	for (i = 0; i < len; i++)
+		chksum += data[i];
+	chksum %= 256;
+
+	return chksum;
+}
+
+static inline bool __smolkvm_gdb_stub_pkt_checksum(const char* pkt, unsigned int pktlen, const char* chksum)
+{
+	unsigned long long from_packet;
+
+	from_packet = strtoull(chksum, NULL, 16);
+
+	return __smolkvm_gdb_stub_checksum(pkt, pktlen) == from_packet;
+}
+
+static inline void __smolkvm_gdb_split_value_comma_value(const char* str, unsigned int len,
+							uint64_t *left, uint64_t *right)
+{
+	unsigned long long l, r;
+
+	// TODO make this safe
+	l = strtoull(str, NULL, 16);
+	while (*str && *str != ',')
+		str++;
+	if (*str == ',')
+		str++;
+	r = strtoull(str, NULL, 16);
+
+	*left = l;
+	*right = r;
+}
+
+#define __smolkvm_gdb_stub_start_match(_token) \
+	(len >= (sizeof(_token) - 1) && \
+	 memcmp(raw, _token, sizeof(_token) - 1) == 0)
+
+static inline int __smolkvm_gdb_stub_pkt_unpack(const unsigned char *raw,
+	unsigned int len, struct smolkvm_gdb_stub_pkt *pkt)
+{
+	unsigned char type = *raw++;
+	len--;
+
+	switch(type) {
+	case SMOLKVM_GDB_STUB_PKTTYPE_CONTINUE:
+		pkt->type = SMOLKVM_GDB_STUB_CONTINUE;
+	break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_STEP:
+		pkt->type = SMOLKVM_GDB_STUB_STEP;
+	break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_STOP_REASON:
+		pkt->type = SMOLKVM_GDB_STUB_STOP_REASON;
+		break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_READ_REGS:
+		pkt->type = SMOLKVM_GDB_STUB_READ_REGS;
+	break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_READ_MEM:  // Add this
+		pkt->type = SMOLKVM_GDB_STUB_READ_MEM;
+		__smolkvm_gdb_split_value_comma_value(raw, len, &pkt->read_mem.addr, &pkt->read_mem.len);
+		break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_QUERY:
+		pkt->type = SMOLKVM_GDB_STUB_QUERY;
+		if (__smolkvm_gdb_stub_start_match(__smolkvm_gdb_pkt_query_attached))
+			pkt->query.subtype = SMOLKVM_GDB_STUB_QUERY_ATTACHED;
+		else if (__smolkvm_gdb_stub_start_match(__smolkvm_gdb_pkt_query_support))
+			pkt->query.subtype = SMOLKVM_GDB_STUB_QUERY_SUPPORTED;
+		else if (__smolkvm_gdb_stub_start_match(__smolkvm_gdb_pkt_query_xfer))
+			pkt->query.subtype = SMOLKVM_GDB_STUB_QUERY_XFER_FEATURES;
+		else
+			pkt->query.subtype = SMOLKVM_GDB_STUB_QUERY_UNKNOWN;
+		break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_H:
+		pkt->type = SMOLKVM_GDB_STUB_H;
+		break;
+	case SMOLKVM_GDB_STUB_PKTTYPE_V:
+		pkt->type = SMOLKVM_GDB_STUB_V;
+		if (__smolkvm_gdb_stub_start_match(__smolkvm_gdb_pkt_v_cont))
+			pkt->query.subtype = SMOLKVM_GDB_STUB_V_CONT;
+		else if (__smolkvm_gdb_stub_start_match(__smolkvm_gdb_pkt_v_mustreplyempty))
+			pkt->query.subtype = SMOLKVM_GDB_STUB_V_MUSTREPLYEMPTY;
+		else
+			pkt->query.subtype = SMOLKVM_GDB_STUB_V_UNKNOWN;
+		break;
+	default:
+		pkt->type = SMOLKVM_GDB_STUB_UNKNOWN;
+		return -1;
+	}
+
+	return 0;
+}
+#endif /* SMOLKVM_WANT_GDB_STUB */
+#endif /* fold */
 
 /* mmio handling */
 #ifdef SMOLKVM_FOLD
