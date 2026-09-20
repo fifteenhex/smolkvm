@@ -68,6 +68,8 @@
  *   SMOLKVM_WANT_APIC            -- Machine with the in-kernel APIC + PIT (boots stock OSes).
  *   SMOLKVM_WANT_VIRTIO_GPU      -- Add a virtio-gpu whose scanout is served over VNC by
  *                                   smolrfb. Needs SMOLKVM_WANT_APIC and -I<smolrfb>.
+ *   SMOLKVM_WANT_VIRTIO_INPUT    -- Add a virtio-input keyboard fed by the display's
+ *                                   viewers. Needs SMOLKVM_WANT_VIRTIO_GPU.
  *   SMOLKVM_VIRTIO_GPU_WIDTH     -- Display size, see defaults below. Both can also be set
  *   SMOLKVM_VIRTIO_GPU_HEIGHT       at runtime with smolkvm_virtio_gpu_configure().
  *   SMOLKVM_VIRTIO_GPU_PORT      -- Port the RFB server listens on (loopback only by default).
@@ -102,8 +104,16 @@
 #endif
 
 /* Anything that rides the virtio-mmio transport pulls the transport in */
-#ifdef SMOLKVM_WANT_VIRTIO_GPU
+#if defined(SMOLKVM_WANT_VIRTIO_GPU) || defined(SMOLKVM_WANT_VIRTIO_INPUT)
 #define SMOLKVM_WANT_VIRTIO
+#endif
+
+/*
+ * The input device's events come from the gpu's RFB server, so there is
+ * nowhere for them to come from without it.
+ */
+#if defined(SMOLKVM_WANT_VIRTIO_INPUT) && !defined(SMOLKVM_WANT_VIRTIO_GPU)
+#error "smolkvm: SMOLKVM_WANT_VIRTIO_INPUT needs SMOLKVM_WANT_VIRTIO_GPU (its events come from the display's viewers)"
 #endif
 #if !defined(SMOLKVM_WANT_SIMPLE) && !defined(SMOLKVM_WANT_APIC)
 #define SMOLKVM_WANT_SIMPLE
@@ -164,6 +174,7 @@
 #define SMOLKVM_ERR_CREATE_IRQCHIP  116
 #define SMOLKVM_ERR_CREATE_PIT      117
 #define SMOLKVM_ERR_CREATE_VIRTIO_GPU 118
+#define SMOLKVM_ERR_CREATE_VIRTIO_INPUT 119
 
 #endif
 /* -- */
@@ -3644,6 +3655,421 @@ static const struct smolkvm_mmio_reg __smolkvm_virtio_mmio_regs[] = {
 #endif
 /* -- */
 
+/* virtio-input: a keyboard, fed by whoever is looking at the display */
+#ifdef SMOLKVM_FOLD
+#ifdef SMOLKVM_WANT_VIRTIO_INPUT
+
+/*
+ * A virtio-input keyboard taking its keystrokes from smolrfb's viewers.
+ *
+ * EV_KEY only. RFB reports absolute pointer coordinates too, but nothing in
+ * the guest is asking for them; a pointer wants its own EV_ABS device with an
+ * ABS_INFO answer in the config space rather than more of this one.
+ *
+ * RFB speaks X11 keysyms and Linux wants evdev keycodes, so there is a table.
+ * A keysym names the character wanted rather than the key pressed, so the
+ * shifted ones map to the unshifted key -- '!' is KEY_1 -- and the shift that
+ * produced it arrives as its own Shift_L press from the viewer.
+ *
+ * EV_REP is deliberately not offered: viewers send their own repeats while a
+ * key is held, and a kernel autorepeat on top turns one press into a burst.
+ */
+
+#include <linux/input-event-codes.h>
+
+#define SMOLKVM_VIRTIO_INPUT_PHYS	(SMOLKVM_MMIO_HOLE_PHYS + 0x5000)
+#define SMOLKVM_VIRTIO_INPUT_LEN	0x1000
+/* 4 is the UART, 5 the gpu; 6 was the floppy, which there isn't one of */
+#define SMOLKVM_VIRTIO_INPUT_IRQ	6
+
+/* Events the driver hands us, and status the driver sends back */
+#define __SMOLKVM_VIRTIO_INPUT_QUEUES_NUM	2
+#define __SMOLKVM_VIRTIO_INPUT_QUEUE_EVENT	0
+#define __SMOLKVM_VIRTIO_INPUT_QUEUE_STATUS	1
+
+/* More than anyone can type between two exits */
+#ifndef SMOLKVM_VIRTIO_INPUT_QUEUE_SZ
+#define SMOLKVM_VIRTIO_INPUT_QUEUE_SZ	64
+#endif
+
+#define __SMOLKVM_VIRTIO_ID_INPUT		18
+
+/* What the configuration space is showing (linux/virtio_input.h) */
+#define __SMOLKVM_VIRTIO_INPUT_CFG_UNSET	0x00
+#define __SMOLKVM_VIRTIO_INPUT_CFG_ID_NAME	0x01
+#define __SMOLKVM_VIRTIO_INPUT_CFG_ID_SERIAL	0x02
+#define __SMOLKVM_VIRTIO_INPUT_CFG_ID_DEVIDS	0x03
+#define __SMOLKVM_VIRTIO_INPUT_CFG_PROP_BITS	0x10
+#define __SMOLKVM_VIRTIO_INPUT_CFG_EV_BITS	0x11
+#define __SMOLKVM_VIRTIO_INPUT_CFG_ABS_INFO	0x12
+
+struct __smolkvm_virtio_input_devids {
+	uint16_t bustype;
+	uint16_t vendor;
+	uint16_t product;
+	uint16_t version;
+};
+
+/*
+ * The driver writes select/subsel, reads back size, then reads that many bytes
+ * out of the union. So a write to either has to leave both already answered.
+ */
+struct __smolkvm_virtio_input_config {
+	uint8_t select;
+	uint8_t subsel;
+	uint8_t size;
+	uint8_t reserved[5];
+	union {
+		char string[128];
+		uint8_t bitmap[128];
+		struct __smolkvm_virtio_input_devids ids;
+	} u;
+};
+
+struct __smolkvm_virtio_input_event {
+	uint16_t type;
+	uint16_t code;
+	uint32_t value;
+};
+
+struct __smolkvm_virtio_input_priv {
+	struct __smolkvm_virtq vq[__SMOLKVM_VIRTIO_INPUT_QUEUES_NUM];
+	struct __smolkvm_virtio_input_config config;
+
+	/* Which keys this claims to have, as the bitmap the driver reads */
+	uint8_t keybits[16];
+
+	struct smolkvm_vm *vm;	/* for the callbacks, which get no vm of their own */
+};
+
+static struct __smolkvm_virtio_mmio __smolkvm_virtio_input_dev;
+static struct __smolkvm_virtio_input_priv __smolkvm_virtio_input_priv;
+
+/*
+ * X11 keysym to evdev keycode. Letters and digits are worked out rather than
+ * listed; this is everything else. Shifted punctuation maps to the key that
+ * carries it and the viewer sends the shift separately.
+ */
+struct __smolkvm_virtio_input_keymap {
+	uint32_t keysym;
+	uint16_t keycode;
+};
+
+static const struct __smolkvm_virtio_input_keymap __smolkvm_virtio_input_keys[] = {
+	{ ' ',    KEY_SPACE },
+	{ '!',    KEY_1 },      { '@',    KEY_2 },      { '#',    KEY_3 },
+	{ '$',    KEY_4 },      { '%',    KEY_5 },      { '^',    KEY_6 },
+	{ '&',    KEY_7 },      { '*',    KEY_8 },      { '(',    KEY_9 },
+	{ ')',    KEY_0 },
+	{ '-',    KEY_MINUS },  { '_',    KEY_MINUS },
+	{ '=',    KEY_EQUAL },  { '+',    KEY_EQUAL },
+	{ '[',    KEY_LEFTBRACE },  { '{',    KEY_LEFTBRACE },
+	{ ']',    KEY_RIGHTBRACE }, { '}',    KEY_RIGHTBRACE },
+	{ '\\',   KEY_BACKSLASH },  { '|',    KEY_BACKSLASH },
+	{ ';',    KEY_SEMICOLON },  { ':',    KEY_SEMICOLON },
+	{ '\'',   KEY_APOSTROPHE }, { '"',    KEY_APOSTROPHE },
+	{ '`',    KEY_GRAVE },  { '~',    KEY_GRAVE },
+	{ ',',    KEY_COMMA },  { '<',    KEY_COMMA },
+	{ '.',    KEY_DOT },    { '>',    KEY_DOT },
+	{ '/',    KEY_SLASH },  { '?',    KEY_SLASH },
+
+	{ 0xff08, KEY_BACKSPACE },
+	{ 0xff09, KEY_TAB },
+	{ 0xff0d, KEY_ENTER },
+	{ 0xff1b, KEY_ESC },
+	{ 0xff50, KEY_HOME },
+	{ 0xff51, KEY_LEFT },
+	{ 0xff52, KEY_UP },
+	{ 0xff53, KEY_RIGHT },
+	{ 0xff54, KEY_DOWN },
+	{ 0xff55, KEY_PAGEUP },
+	{ 0xff56, KEY_PAGEDOWN },
+	{ 0xff57, KEY_END },
+	{ 0xff63, KEY_INSERT },
+	{ 0xffff, KEY_DELETE },
+
+	{ 0xffbe, KEY_F1 },     { 0xffbf, KEY_F2 },     { 0xffc0, KEY_F3 },
+	{ 0xffc1, KEY_F4 },     { 0xffc2, KEY_F5 },     { 0xffc3, KEY_F6 },
+	{ 0xffc4, KEY_F7 },     { 0xffc5, KEY_F8 },     { 0xffc6, KEY_F9 },
+	{ 0xffc7, KEY_F10 },    { 0xffc8, KEY_F11 },    { 0xffc9, KEY_F12 },
+
+	{ 0xffe1, KEY_LEFTSHIFT },  { 0xffe2, KEY_RIGHTSHIFT },
+	{ 0xffe3, KEY_LEFTCTRL },   { 0xffe4, KEY_RIGHTCTRL },
+	{ 0xffe9, KEY_LEFTALT },    { 0xffea, KEY_RIGHTALT },
+	{ 0xffeb, KEY_LEFTMETA },   { 0xffec, KEY_RIGHTMETA },
+	{ 0xffe5, KEY_CAPSLOCK },
+};
+
+/* a-z in keycode order, so the letter indexes straight into it */
+static const uint16_t __smolkvm_virtio_input_letters[26] = {
+	KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I,
+	KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R,
+	KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z,
+};
+
+/* KEY_0 is above the 9, not below the 1 */
+static const uint16_t __smolkvm_virtio_input_digits[10] = {
+	KEY_0, KEY_1, KEY_2, KEY_3, KEY_4,
+	KEY_5, KEY_6, KEY_7, KEY_8, KEY_9,
+};
+
+/* 0 for a keysym with no key here, which is not a valid keycode either */
+static uint16_t __smolkvm_virtio_input_keycode(uint32_t keysym)
+{
+	unsigned int i;
+
+	if (keysym >= 'a' && keysym <= 'z')
+		return __smolkvm_virtio_input_letters[keysym - 'a'];
+	if (keysym >= 'A' && keysym <= 'Z')
+		return __smolkvm_virtio_input_letters[keysym - 'A'];
+	if (keysym >= '0' && keysym <= '9')
+		return __smolkvm_virtio_input_digits[keysym - '0'];
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(__smolkvm_virtio_input_keys); i++)
+		if (__smolkvm_virtio_input_keys[i].keysym == keysym)
+			return __smolkvm_virtio_input_keys[i].keycode;
+
+	return 0;
+}
+
+/* Every keycode the table above can produce, as the bitmap the driver reads */
+static void __smolkvm_virtio_input_build_keybits(struct __smolkvm_virtio_input_priv *in)
+{
+	unsigned int i;
+
+	memset(in->keybits, 0, sizeof(in->keybits));
+
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(__smolkvm_virtio_input_letters); i++) {
+		uint16_t k = __smolkvm_virtio_input_letters[i];
+
+		in->keybits[k / 8] |= (uint8_t) (1u << (k % 8));
+	}
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(__smolkvm_virtio_input_digits); i++) {
+		uint16_t k = __smolkvm_virtio_input_digits[i];
+
+		in->keybits[k / 8] |= (uint8_t) (1u << (k % 8));
+	}
+	for (i = 0; i < SMOLKVM_ARRAYSIZE(__smolkvm_virtio_input_keys); i++) {
+		uint16_t k = __smolkvm_virtio_input_keys[i].keycode;
+
+		if (k / 8 < sizeof(in->keybits))
+			in->keybits[k / 8] |= (uint8_t) (1u << (k % 8));
+	}
+}
+
+/* Answer whatever select/subsel now says, so the size read after it is right */
+static void __smolkvm_virtio_input_refill_config(struct __smolkvm_virtio_input_priv *in)
+{
+	struct __smolkvm_virtio_input_config *cfg = &in->config;
+	const char *str = NULL;
+
+	memset(&cfg->u, 0, sizeof(cfg->u));
+	cfg->size = 0;
+
+	switch (cfg->select) {
+	case __SMOLKVM_VIRTIO_INPUT_CFG_ID_NAME:
+		str = "smolkvm virtio keyboard";
+		break;
+	case __SMOLKVM_VIRTIO_INPUT_CFG_ID_SERIAL:
+		str = "smolkvm";
+		break;
+	case __SMOLKVM_VIRTIO_INPUT_CFG_ID_DEVIDS:
+		/* BUS_VIRTUAL, which lives in linux/input.h rather than the
+		 * event codes; not worth pulling the whole header in for */
+		cfg->u.ids.bustype = 0x06;
+		cfg->u.ids.vendor = 0;
+		cfg->u.ids.product = 0;
+		cfg->u.ids.version = 1;
+		cfg->size = sizeof(cfg->u.ids);
+		return;
+	case __SMOLKVM_VIRTIO_INPUT_CFG_EV_BITS:
+		/*
+		 * EV_KEY and nothing else. A size of zero is how the driver is
+		 * told an event type is not supported, so every other subsel --
+		 * including EV_REP, see above -- falls through to it.
+		 */
+		if (cfg->subsel == EV_KEY) {
+			memcpy(cfg->u.bitmap, in->keybits, sizeof(in->keybits));
+			cfg->size = sizeof(in->keybits);
+		}
+		return;
+	default:
+		/* PROP_BITS, ABS_INFO and anything else: nothing to say */
+		return;
+	}
+
+	strncpy(cfg->u.string, str, sizeof(cfg->u.string) - 1);
+	cfg->size = (uint8_t) strlen(cfg->u.string);
+}
+
+static void __smolkvm_virtio_input_config_write(struct smolkvm_vm *vm,
+						struct __smolkvm_virtio_mmio *dev,
+						uint64_t offset, uint8_t len,
+						uint64_t value)
+{
+	struct __smolkvm_virtio_input_priv *in = dev->priv;
+
+	/* select and subsel are the only writable bytes; both re-answer */
+	if (offset == offsetof(struct __smolkvm_virtio_input_config, select))
+		in->config.select = (uint8_t) value;
+	else if (offset == offsetof(struct __smolkvm_virtio_input_config, subsel))
+		in->config.subsel = (uint8_t) value;
+	else
+		return;
+
+	__smolkvm_virtio_input_refill_config(in);
+}
+
+/*
+ * Put one event in front of the guest. The driver keeps the event queue
+ * stocked with empty buffers; with none there the keystroke is dropped.
+ */
+static bool __smolkvm_virtio_input_send(struct smolkvm_vm *vm,
+					uint16_t type, uint16_t code, uint32_t value)
+{
+	struct __smolkvm_virtio_input_priv *in = &__smolkvm_virtio_input_priv;
+	struct __smolkvm_virtq *vq = &in->vq[__SMOLKVM_VIRTIO_INPUT_QUEUE_EVENT];
+	struct __smolkvm_virtio_input_event ev;
+	struct __smolkvm_virtq_chain chain;
+
+	if (!__smolkvm_virtq_pop(vm, vq, &chain)) {
+		__smolkvm_debug("virtio-input: no buffers, dropping %u/%u\n", type, code);
+		return false;
+	}
+
+	ev.type = type;
+	ev.code = code;
+	ev.value = value;
+
+	__smolkvm_virtq_chain_write(vm, &chain, &ev, sizeof(ev));
+	__smolkvm_virtq_push(vm, vq, &chain);
+
+	return true;
+}
+
+/* smolrfb has a key event for us. This runs inside the display's poll. */
+static void __smolkvm_virtio_input_rfb_key(void *user, uint32_t keysym, int down)
+{
+	struct __smolkvm_virtio_input_priv *in = &__smolkvm_virtio_input_priv;
+	struct smolkvm_vm *vm = user;
+	uint16_t keycode;
+
+	keycode = __smolkvm_virtio_input_keycode(keysym);
+	if (!keycode) {
+		__smolkvm_debug("virtio-input: no key for keysym 0x%x\n", keysym);
+		return;
+	}
+
+	/*
+	 * A report after the key is what tells the input layer the batch is
+	 * complete; without it evdev readers sit waiting for the rest.
+	 */
+	if (!__smolkvm_virtio_input_send(vm, EV_KEY, keycode, down ? 1 : 0))
+		return;
+	__smolkvm_virtio_input_send(vm, EV_SYN, SYN_REPORT, 0);
+
+	__smolkvm_virtio_signal_used(vm, &__smolkvm_virtio_input_dev);
+}
+
+/* The status queue carries things like LED changes; take them and say nothing */
+static void __smolkvm_virtio_input_status_queue(struct smolkvm_vm *vm,
+						struct __smolkvm_virtio_input_priv *in)
+{
+	struct __smolkvm_virtq *vq = &in->vq[__SMOLKVM_VIRTIO_INPUT_QUEUE_STATUS];
+	struct __smolkvm_virtq_chain chain;
+	bool notify = false;
+
+	while (__smolkvm_virtq_pop(vm, vq, &chain)) {
+		notify = true;
+		__smolkvm_virtq_push(vm, vq, &chain);
+	}
+
+	if (notify)
+		__smolkvm_virtio_signal_used(vm, &__smolkvm_virtio_input_dev);
+}
+
+static void __smolkvm_virtio_input_notify(struct smolkvm_vm *vm,
+					  struct __smolkvm_virtio_mmio *dev,
+					  uint32_t queue)
+{
+	struct __smolkvm_virtio_input_priv *in = dev->priv;
+
+	/*
+	 * A kick on the event queue is the driver handing us empty buffers to
+	 * fill, so there is nothing to do but note they are there -- the next
+	 * keystroke will find them.
+	 */
+	if (queue == __SMOLKVM_VIRTIO_INPUT_QUEUE_STATUS)
+		__smolkvm_virtio_input_status_queue(vm, in);
+}
+
+static void __smolkvm_virtio_input_reset(struct smolkvm_vm *vm,
+					 struct __smolkvm_virtio_mmio *dev)
+{
+	struct __smolkvm_virtio_input_priv *in = dev->priv;
+
+	in->config.select = __SMOLKVM_VIRTIO_INPUT_CFG_UNSET;
+	in->config.subsel = 0;
+	__smolkvm_virtio_input_refill_config(in);
+}
+
+static struct __smolkvm_virtio_mmio __smolkvm_virtio_input_dev = {
+	.device_id = __SMOLKVM_VIRTIO_ID_INPUT,
+	.device_features = __SMOLKVM_VIRTIO_F_VERSION_1,
+	.irq = SMOLKVM_VIRTIO_INPUT_IRQ,
+	.vq = __smolkvm_virtio_input_priv.vq,
+	.num_vq = __SMOLKVM_VIRTIO_INPUT_QUEUES_NUM,
+	.queue_sz = SMOLKVM_VIRTIO_INPUT_QUEUE_SZ,
+	.config = &__smolkvm_virtio_input_priv.config,
+	.config_len = sizeof(__smolkvm_virtio_input_priv.config),
+	.notify = __smolkvm_virtio_input_notify,
+	.reset = __smolkvm_virtio_input_reset,
+	/* Without this the select writes go nowhere and the driver reads back a
+	 * size of zero for everything: a device with no name and no keys */
+	.config_write = __smolkvm_virtio_input_config_write,
+	.priv = &__smolkvm_virtio_input_priv,
+};
+
+static struct smolkvm_mmio __smolkvm_virtio_input = {
+	.name = "virtio-input",
+	.phys = SMOLKVM_VIRTIO_INPUT_PHYS,
+	.len = SMOLKVM_VIRTIO_INPUT_LEN,
+	.regs = __smolkvm_virtio_mmio_regs,
+	.num_regs = SMOLKVM_ARRAYSIZE(__smolkvm_virtio_mmio_regs),
+	.write = __smolkvm_virtio_mmio_write,
+	.read = __smolkvm_virtio_mmio_read,
+	.priv = &__smolkvm_virtio_input_dev,
+};
+
+/* What the display hands its viewers' keystrokes to */
+static void __smolkvm_virtio_input_hooks(struct smolkvm_vm *vm,
+					 struct smolrfb_input *hooks)
+{
+	memset(hooks, 0, sizeof(*hooks));
+
+	hooks->key = __smolkvm_virtio_input_rfb_key;
+	/* No pointer: nothing in the guest has anywhere to put one yet */
+	hooks->user = vm;
+}
+
+static inline int __smolkvm_virtio_input_create(struct smolkvm_vm *vm)
+{
+	struct __smolkvm_virtio_input_priv *in = &__smolkvm_virtio_input_priv;
+
+	in->vm = vm;
+	__smolkvm_virtio_input_build_keybits(in);
+	__smolkvm_virtio_input_refill_config(in);
+
+	printf("virtio-input: keyboard, fed by the display's viewers\n");
+
+	return __smolkvm_plugin_mmio(vm, &__smolkvm_virtio_input);
+}
+
+#endif /* SMOLKVM_WANT_VIRTIO_INPUT */
+#endif
+/* -- */
+
+
 /* virtio-gpu: a 2D scanout on a virtio-mmio transport, shown by smolrfb */
 #ifdef SMOLKVM_FOLD
 #ifdef SMOLKVM_WANT_VIRTIO_GPU
@@ -4479,12 +4905,22 @@ void smolkvm_virtio_gpu_configure(int width, int height,
 const char *smolkvm_virtio_cmdline(void)
 {
 	static char fragment[192];
+	int n;
 
-	snprintf(fragment, sizeof(fragment),
+	n = snprintf(fragment, sizeof(fragment),
 		     "virtio_mmio.device=0x%llx@0x%llx:%d",
 		     (unsigned long long) SMOLKVM_VIRTIO_GPU_LEN,
 		     (unsigned long long) SMOLKVM_VIRTIO_GPU_PHYS,
 		     SMOLKVM_VIRTIO_GPU_IRQ);
+
+#ifdef SMOLKVM_WANT_VIRTIO_INPUT
+	if (n > 0 && (size_t) n < sizeof(fragment))
+		snprintf(fragment + n, sizeof(fragment) - n,
+			 " virtio_mmio.device=0x%llx@0x%llx:%d",
+			 (unsigned long long) SMOLKVM_VIRTIO_INPUT_LEN,
+			 (unsigned long long) SMOLKVM_VIRTIO_INPUT_PHYS,
+			 SMOLKVM_VIRTIO_INPUT_IRQ);
+#endif
 
 	return fragment;
 }
@@ -4518,6 +4954,14 @@ static inline int __smolkvm_virtio_gpu_create(struct smolkvm_vm *vm)
 
 	/* One scanout, no capsets, no blobs: the 2D device and nothing else */
 	g->config.num_scanouts = 1;
+
+#ifdef SMOLKVM_WANT_VIRTIO_INPUT
+	/* Viewers' keystrokes go to the virtio-input keyboard */
+	struct smolrfb_input hooks;
+
+	__smolkvm_virtio_input_hooks(vm, &hooks);
+	input = &hooks;
+#endif
 
 	ret = smolrfb_open(&g->rfb, g->bind_addr, g->port, g->width, g->height,
 			   "smolkvm", input);
@@ -4863,6 +5307,13 @@ int smolkvm_create_vm(struct smolkvm_vm *vm)
 		return -SMOLKVM_ERR_CREATE_VIRTIO_GPU;
 #endif
 
+#ifdef SMOLKVM_WANT_VIRTIO_INPUT
+	/* After the display: its viewers are where the keystrokes come from */
+	ret = __smolkvm_virtio_input_create(vm);
+	if (ret)
+		return -SMOLKVM_ERR_CREATE_VIRTIO_INPUT;
+#endif
+
 	return 0;
 }
 
@@ -4889,6 +5340,9 @@ void smolkvm_dump_register_header_novm(FILE *out)
 #endif
 #ifdef SMOLKVM_WANT_VIRTIO_GPU
 	__smolkvm_plugin_mmio(&vm, &__smolkvm_virtio_gpu);
+#endif
+#ifdef SMOLKVM_WANT_VIRTIO_INPUT
+	__smolkvm_plugin_mmio(&vm, &__smolkvm_virtio_input);
 #endif
 
 	smolkvm_dump_register_header(&vm, out);

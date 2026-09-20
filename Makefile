@@ -14,7 +14,10 @@ HDR := smolkvm.h
 
 DEBUG_FLAGS := -DSMOLKVM_DEBUG
 GDB_FLAGS   := -DSMOLKVM_WANT_GDB_STUB -DSMOLKVM_WANT_GDB_STUB_DEBUG
-GPU_FLAGS   := -DSMOLKVM_WANT_VIRTIO_GPU -I$(SMOLRFBDIR)
+# The input device takes its events from the display's viewers, so the two are
+# built together. Drop SMOLKVM_WANT_VIRTIO_INPUT for the display on its own.
+GPU_FLAGS   := -DSMOLKVM_WANT_VIRTIO_GPU -DSMOLKVM_WANT_VIRTIO_INPUT \
+	       -I$(SMOLRFBDIR)
 
 VARIANTS := _libc _debug_libc _gdb_libc _debug_gdb_libc
 

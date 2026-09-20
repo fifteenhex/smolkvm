@@ -22,7 +22,8 @@ This is a single header implementation of a very crappy "virtual machine".
   guests) and APIC (KVM's in-kernel APIC/IOAPIC/PIC/PIT + a legacy COM1
   UART, boots stock Linux).
 - meh grade gdb stub.
-- Optional virtio-gpu, scanned out to VNC viewers by smolrfb. See below.
+- Optional virtio-gpu, scanned out to VNC viewers by smolrfb, and a
+  virtio-input keyboard fed by those same viewers. See below.
 - lots of bugs
 - Compiles to a completely self standing static binary with nolibc: pass
   both `NOLIBCDIR` (your nolibc, e.g. `tools/include/nolibc` in the linux
@@ -68,8 +69,11 @@ make -f Makefile.test run-gpu       # build the lot, boot it, leave it up
 
 and point a VNC viewer at `127.0.0.1:5900`. That builds a kernel and a rootfs
 from scratch the first time, so it is not quick. `VNC_PORT` and `RUN_CMDLINE`
-override the obvious things. There is a shell on the serial console and, with
-`console=tty0`, the kernel log on the display as well.
+override the obvious things.
+
+There are two shells: one on the serial console and one on `tty1`, on the
+display. Both can be typed at -- a viewer's keystrokes go to a virtio-input
+keyboard.
 
 To drive it yourself instead:
 
@@ -79,12 +83,11 @@ make SMOLRFBDIR=/path/to/smolrfb
 	-c "console=tty0 console=ttyS0" -g 1280x800 -p 5900
 ```
 
-`console=tty0` is what puts the
-kernel log on the display; without it you get the boot logo on black and no way
-to tell a working display from a stuck one. Note also that Linux stops reading
-its own parameters at a standalone `--`, so anything after that goes to init
-rather than the kernel -- smolkvm puts its own `virtio_mmio.device=` in front of
-one for you.
+`console=tty0` is what puts the kernel log on the display; without it you get
+the boot logo on black and no way to tell a working display from a stuck one.
+Note also that Linux stops reading its own parameters at a standalone `--`, so
+anything after that goes to init rather than the kernel -- smolkvm puts its own
+`virtio_mmio.device=` in front of one for you.
 
 `-g` sets the display size and `-p` the port; both default to 1024x768 on 5900.
 The server binds loopback only -- there is no authentication in smolrfb, so
@@ -105,13 +108,18 @@ Everything the test pipeline downloads, unpacks, clones or builds lands in
 `make -f Makefile.test distclean`) is always safe. The config fragments it
 needs are in `test/`.
 
-```
-make -f Makefile.test smoke-gpu
-```
-
-boots the whole lot and passes once the console has moved onto the display.
-
 The device is 2D only: no virgl, no blob resources, no EDID.
+
+`SMOLKVM_WANT_VIRTIO_INPUT` adds the keyboard that goes with it, taking its
+keystrokes from the display's viewers -- so it needs the gpu, which is where
+the viewers are. The Makefile builds the two together. It is EV_KEY only: RFB
+reports pointer motion as well, but nothing in the guest is asking for absolute
+coordinates yet, and a pointer means a second EV_ABS device.
+
+RFB speaks X11 keysyms and Linux wants evdev keycodes, so there is a table
+between them. A keysym names the character wanted rather than the key pressed,
+so the shifted ones map to the unshifted key -- `!` is `KEY_1` -- and the shift
+that produced it arrives as its own keypress from the viewer.
 
 ### Doom
 
@@ -136,3 +144,12 @@ doomgeneric's own iwad search is compiled out, so say where it is:
 ```
 doom -iwad /usr/share/doom/doom1.wad
 ```
+
+smol2d picks a keyboard out of `/dev/input`, which is where the virtio-input
+device puts one, so doom is playable from a viewer.
+
+```
+make -f Makefile.test smoke-gpu
+```
+
+boots the whole lot and passes once the console has moved onto the display.
