@@ -86,6 +86,17 @@ building your own command line). The guest kernel needs
 `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y` -- without it nothing parses the
 fragment and no device appears -- along with `CONFIG_DRM_VIRTIO_GPU`,
 `CONFIG_DRM_FBDEV_EMULATION` and the VT layer if you want a console on it.
-There is no config fragment for that here yet, so turn those on by hand.
+`test/kernel-gpu.config` is that fragment.
+
+Everything the test pipeline downloads, unpacks, clones or builds lands in
+`build/`, and nothing checked in lives under there -- so `rm -rf build` (or
+`make -f Makefile.test distclean`) is always safe. The config fragments it
+needs are in `test/`.
+
+```
+make -f Makefile.test smoke-gpu
+```
+
+boots the whole lot and passes once the console has moved onto the display.
 
 The device is 2D only: no virgl, no blob resources, no EDID.

@@ -3,6 +3,7 @@
 # lot under smolkvm -- passing if the guest reaches an interactive shell.
 #
 #   make -f Makefile.test smoke       # the whole pipeline, as a pass/fail
+#   make -f Makefile.test smoke-gpu   # ...and again with the display
 #   make -f Makefile.test kernel      # just build vmlinux
 #   make -f Makefile.test initramfs   # just build the smolutils initramfs
 #   make -f Makefile.test clean       # drop build products, keep the downloads
@@ -38,6 +39,14 @@ KOUT    := $(CURDIR)/$(KERNEL_SRC)/smolkvm-build
 VMLINUX := $(KOUT)/vmlinux
 CONFIG  := $(CURDIR)/$(TESTDIR)/kernel.config
 
+# The virtio-gpu smoke test needs DRM and the VT layer, which the base config
+# deliberately leaves out, so it gets a config and a build directory of its own
+# rather than making the plain boot drag a display around.
+GPU_KOUT    := $(CURDIR)/$(KERNEL_SRC)/smolkvm-build-gpu
+GPU_VMLINUX := $(GPU_KOUT)/vmlinux
+GPU_CONFIG  := $(CURDIR)/$(TESTDIR)/kernel-gpu.config
+GPU_MERGED  := $(CURDIR)/$(BUILDDIR)/kernel-gpu.merged
+
 # --- userspace: smolutils ----------------------------------------------------
 
 SMOLUTILS_URL := https://github.com/fifteenhex/smolutils.git
@@ -70,6 +79,11 @@ INITRAMFS := $(CURDIR)/$(SMOLUTILS_SRC)/x86_64.cpio.gz
 # Built by the main Makefile.
 SMOLKVM := smolkvm_test_apic_libc
 IPL     := ipl/build/ipl
+
+# The virtio-gpu build, and where its smolrfb lives. Override SMOLRFBDIR if your
+# checkout is somewhere else; the default assumes it sits beside this one.
+SMOLKVM_GPU := smolkvm_test_apic_gpu_libc
+SMOLRFBDIR  ?= $(CURDIR)/../smolrfb
 
 SMOKE_TIMEOUT := 90
 # Everything after `--` is passed to smolutils' init (see its README).
@@ -104,6 +118,17 @@ $(VMLINUX): $(KERNEL_STAMP) $(CONFIG)
 
 kernel: $(VMLINUX)
 .PHONY: kernel
+
+$(GPU_MERGED): $(CONFIG) $(GPU_CONFIG)
+	mkdir -p $(BUILDDIR)
+	cat $(CONFIG) $(GPU_CONFIG) > $@
+
+$(GPU_VMLINUX): $(KERNEL_STAMP) $(GPU_MERGED)
+	$(MAKE) -C $(KERNEL_SRC) O=$(GPU_KOUT) allnoconfig KCONFIG_ALLCONFIG=$(GPU_MERGED)
+	$(MAKE) -C $(KERNEL_SRC) O=$(GPU_KOUT) -j$(NPROC) vmlinux
+
+kernel-gpu: $(GPU_VMLINUX)
+.PHONY: kernel-gpu
 
 # --- smolutils initramfs -----------------------------------------------------
 
@@ -167,11 +192,47 @@ smoke: $(VMLINUX) $(INITRAMFS) smolkvm-bits
 	fi
 .PHONY: smoke
 
+# --- the virtio-gpu smoke test -----------------------------------------------
+
+GPU_SMOKE_LOG := $(BUILDDIR)/smoke-gpu.log
+# fbcon binding to the virtio-gpu's fbdev emulation is the last link in the
+# chain: the device answered, the driver probed, a mode was set and the console
+# moved onto it.
+GPU_SMOKE_MARKER := virtio_gpudrmfb
+
+smolkvm-gpu-bits:
+	$(MAKE) $(SMOLKVM_GPU) $(IPL) SMOLRFBDIR=$(SMOLRFBDIR)
+.PHONY: smolkvm-gpu-bits
+
+# Same shape as `smoke`, with the display attached. The VNC server binds
+# loopback; connect a viewer to :5900 while it runs to watch it boot.
+smoke-gpu: $(GPU_VMLINUX) $(INITRAMFS) smolkvm-gpu-bits
+	@echo "=== booting $(KERNEL_SRC) + smolutils under smolkvm, with a display ==="
+	@rm -f $(GPU_SMOKE_LOG)
+	@./$(SMOLKVM_GPU) -k $(GPU_VMLINUX) -r $(INITRAMFS) -c "$(SMOKE_CMDLINE)" \
+		> $(GPU_SMOKE_LOG) 2>&1 & \
+	pid=$$!; \
+	ok=0; \
+	for i in $$(seq 1 $(SMOKE_TIMEOUT)); do \
+		if grep -q "$(GPU_SMOKE_MARKER)" $(GPU_SMOKE_LOG) 2>/dev/null; then ok=1; break; fi; \
+		kill -0 $$pid 2>/dev/null || break; \
+		sleep 1; \
+	done; \
+	kill $$pid 2>/dev/null; wait $$pid 2>/dev/null; \
+	if [ $$ok = 1 ]; then \
+		echo "GPU SMOKE PASS (the console is on the virtio-gpu)"; \
+	else \
+		echo "GPU SMOKE FAIL -- last lines of $(GPU_SMOKE_LOG):"; \
+		tail -n 20 $(GPU_SMOKE_LOG); \
+		exit 1; \
+	fi
+.PHONY: smoke-gpu
+
 # --- cleanup -----------------------------------------------------------------
 
 # Build products, but keep the downloaded/cloned sources.
 clean:
-	rm -rf $(KOUT) $(SMOKE_LOG)
+	rm -rf $(KOUT) $(GPU_KOUT) $(GPU_MERGED) $(SMOKE_LOG) $(GPU_SMOKE_LOG)
 	-$(MAKE) -C $(SMOLUTILS_SRC) -f Makefile.x86_64 \
 		NOLIBCDIR=$(NOLIBCDIR) NOLIBCEXTDIR=$(NOLIBCEXTDIR) \
 		CROSS_COMPILE=$(SMOLUTILS_CROSS) TARWAK=none clean 2>/dev/null
